@@ -1,0 +1,6 @@
+#Software: Microsoft Exchange Server
+#Version: 15.02.0000.000
+#Log-type: Agent Log
+#Date: 2026-09-26T12:00:00.000Z
+#Fields: Timestamp,SessionId,LocalEndpoint,RemoteEndpoint,EnteredOrgFromIP,MessageId,P1FromAddress,P2FromAddresses,Recipient,NumRecipients,Agent,Event,Action,SmtpResponse,Reason,ReasonData,Diagnostics,NetworkMsgID,TenantID,Directionality
+2026-09-26T12:03:00.000Z,session-1,192.0.2.11:25,198.51.100.30:40000,198.51.100.30,<bad@example>,bad@example.org,bad@example.org,missing@company.example,1,Recipient Filter Agent,OnRcptCommand,Reject,550 5.1.1 User unknown,RecipientNotFound,,,,net-bad,,Incoming

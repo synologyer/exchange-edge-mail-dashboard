@@ -1,0 +1,26 @@
+services:
+  exchange-edge-dashboard:
+    image: whc95800/exchange-edge-mail-dashboard:latest
+    container_name: exchange-edge-dashboard
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      COMPANY_DOMAIN: ${COMPANY_DOMAIN:?set COMPANY_DOMAIN in .env}
+      TRUSTED_EXCHANGE_IP: ${TRUSTED_EXCHANGE_IP:?set TRUSTED_EXCHANGE_IP in .env}
+      EDGE_HOST: ${EDGE_HOST:?set EDGE_HOST in .env}
+      EDGE_PORT: ${EDGE_PORT:-22}
+      EDGE_USERNAME: ${EDGE_USERNAME:?set EDGE_USERNAME in .env}
+      EDGE_PASSWORD_FILE: /run/secrets/edge_password
+      EDGE_LOG_PATH: ${EDGE_LOG_PATH:-/C:/Program Files/Microsoft/Exchange Server/V15/TransportRoles/Logs}
+      # 首次连接后建议填写服务器主机密钥指纹，格式为不带 SHA256: 前缀的 Base64 字符串。
+      EDGE_HOST_KEY_SHA256: ${EDGE_HOST_KEY_SHA256:-}
+      SFTP_SYNC_SECONDS: ${SFTP_SYNC_SECONDS:-60}
+      CACHE_SECONDS: ${CACHE_SECONDS:-60}
+    secrets:
+      - edge_password
+
+secrets:
+  edge_password:
+    file: ./secrets/edge_password.txt

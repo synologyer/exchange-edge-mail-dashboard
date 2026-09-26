@@ -1,0 +1,10 @@
+#Software: Microsoft Exchange Server
+#Version: 15.02.0000.000
+#Log-type: Message Tracking Log
+#Date: 2026-09-26T12:00:00.000Z
+#Fields: date-time,client-ip,server-ip,connector-id,source,event-id,internal-message-id,message-id,network-message-id,recipient-address,recipient-status,total-bytes,recipient-count,related-recipient-address,reference,message-subject,sender-address,return-path,message-info,directionality,tenant-id,original-client-ip,custom-data
+2026-09-26T12:00:00.000Z,192.0.2.10,192.0.2.11,mx\Default internal receive connector MX,SMTP,RECEIVE,1,<out@example>,net-out,{person@example.net},,100,1,,,Quarterly update,boss@company.example,,,Originating,,,
+2026-09-26T12:00:02.000Z,192.0.2.11,203.0.113.10,EdgeSync - Default-First-Site-Name to Internet,SMTP,SENDEXTERNAL,2,<out@example>,net-out,{person@example.net},250 2.0.0 OK,100,1,,,Quarterly update,boss@company.example,,,Originating,,,
+2026-09-26T12:01:00.000Z,198.51.100.20,192.0.2.11,mx\Default internal receive connector MX,SMTP,RECEIVE,3,<in@example>,net-in,{user@company.example},,100,1,,,Hello,user@example.org,,,Incoming,,,
+2026-09-26T12:02:00.000Z,192.0.2.10,192.0.2.11,mx\Default internal receive connector MX,SMTP,RECEIVE,4,<anom@example>,net-anom,{person@example.net},,100,1,,,Unexpected,spoof@outside.example,,,Originating,,,
+2026-09-26T12:02:02.000Z,192.0.2.11,203.0.113.20,EdgeSync - Default-First-Site-Name to Internet,SMTP,SENDEXTERNAL,5,<anom@example>,net-anom,{person@example.net},250 2.0.0 OK,100,1,,,Unexpected,spoof@outside.example,,,Originating,,,
