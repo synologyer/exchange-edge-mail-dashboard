@@ -6,9 +6,9 @@ COPY app.py /app/app.py
 COPY static /app/static
 RUN pip install --no-cache-dir "paramiko==3.5.1" && \
     addgroup -S dashboard && adduser -S -G dashboard dashboard && \
-    mkdir -p /tmp/edge-logs && chown -R dashboard:dashboard /tmp/edge-logs
+    mkdir -p /tmp/edge-logs /data && chown -R dashboard:dashboard /tmp/edge-logs /data
 USER dashboard
-ENV LOG_ROOT=/logs PORT=8080 CACHE_SECONDS=60 MAX_ROWS=10000
+ENV LOG_ROOT=/logs DATABASE_PATH=/data/dashboard.db PORT=8080 CACHE_SECONDS=60 MAX_ROWS=10000
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
   CMD wget -qO- http://127.0.0.1:8080/api/health | grep -q '"status": "ok"' || exit 1

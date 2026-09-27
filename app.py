@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import threading
 import time
 from collections import defaultdict
@@ -19,6 +20,8 @@ except ImportError:
     paramiko = None
 
 SFTP_SYNC_SECONDS = int(os.getenv("SFTP_SYNC_SECONDS", "60"))
+BACKGROUND_INDEX_SECONDS = int(os.getenv("BACKGROUND_INDEX_SECONDS", "30"))
+SFTP_HISTORY_DAYS = int(os.getenv("SFTP_HISTORY_DAYS", "0"))
 COMPANY_DOMAIN = os.getenv("COMPANY_DOMAIN", "").strip().lower().lstrip("@")
 TRUSTED_EXCHANGE_IP = os.getenv("TRUSTED_EXCHANGE_IP", "").strip()
 TRUSTED_EXCHANGE_IPS = {ip.strip() for ip in os.getenv("TRUSTED_EXCHANGE_IPS", TRUSTED_EXCHANGE_IP).split(",") if ip.strip()}
@@ -26,14 +29,15 @@ PORT = int(os.getenv("PORT", "8080"))
 CACHE_SECONDS = int(os.getenv("CACHE_SECONDS", "60"))
 STATIC_ROOT = Path(__file__).parent / "static"
 MAX_ROWS = int(os.getenv("MAX_ROWS", "10000"))
+DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "/data/dashboard.db"))
 
 _cache = {}
 _cache_lock = threading.Lock()
 _build_lock = threading.Lock()
-_row_cache = {}
-_row_cache_lock = threading.Lock()
+_db_lock = threading.Lock()
 _sftp_locks = defaultdict(threading.Lock)
 _sync_state = defaultdict(lambda: {"lastSuccess": 0.0, "lastError": ""})
+_index_state = {"running": False, "lastSuccess": "", "lastError": "", "files": 0, "changed": 0}
 
 
 def edge_nodes():
@@ -101,7 +105,7 @@ def sync_sftp_node(node, force=False):
             verify_host_key(transport.get_remote_server_key(), node["fingerprint"])
             transport.auth_password(node["user"], secret_password(node))
             sftp = paramiko.SFTPClient.from_transport(transport)
-            cutoff = now - (32 * 86400)
+            cutoff = now - (SFTP_HISTORY_DAYS * 86400) if SFTP_HISTORY_DAYS > 0 else 0
 
             def walk(remote_dir, is_root=False):
                 try:
@@ -118,7 +122,7 @@ def sync_sftp_node(node, force=False):
                     mode = entry.st_mode
                     if mode & 0o170000 == 0o040000:
                         yield from walk(remote)
-                    elif entry.filename.lower().endswith(".log") and entry.st_mtime >= cutoff:
+                    elif entry.filename.lower().endswith(".log") and (not cutoff or entry.st_mtime >= cutoff):
                         normalized = remote.lower().replace("\\", "/")
                         if not any(h in normalized for h in ("messagetracking", "agentlog", "protocollog/smtpreceive")):
                             continue
@@ -210,6 +214,108 @@ def log_files(hint, cutoff):
     return sorted(set(result))
 
 
+def database():
+    DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(DATABASE_PATH, timeout=30)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA synchronous=NORMAL")
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS log_files (
+            path TEXT PRIMARY KEY,
+            signature TEXT NOT NULL,
+            row_count INTEGER NOT NULL,
+            indexed_at TEXT NOT NULL
+        )
+    """)
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS log_rows (
+            path TEXT NOT NULL,
+            stamp TEXT NOT NULL,
+            payload TEXT NOT NULL
+        )
+    """)
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_log_rows_stamp ON log_rows(stamp)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_log_rows_path ON log_rows(path)")
+    return connection
+
+
+def parse_log_file(path):
+    parsed, headers = [], None
+    with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as handle:
+        for raw in handle:
+            if raw.startswith("#Fields:"):
+                headers = [part.strip() for part in raw[8:].strip().split(",")]
+                continue
+            if not headers or not raw.strip() or raw.startswith("#"):
+                continue
+            try:
+                values = next(csv.reader([raw]))
+                row = dict(zip(headers, values))
+                stamp = parse_time(row.get("date-time") or row.get("Timestamp"))
+                if stamp:
+                    parsed.append((stamp.isoformat(), json.dumps(row, ensure_ascii=False)))
+            except (csv.Error, ValueError):
+                continue
+    return parsed
+
+
+def index_log_files(files):
+    changed = 0
+    with _db_lock:
+        with database() as connection:
+            for path in files:
+                try:
+                    stat = path.stat()
+                    signature = f"{stat.st_mtime_ns}:{stat.st_size}"
+                    current = connection.execute("SELECT signature FROM log_files WHERE path=?", (str(path),)).fetchone()
+                    if current and current[0] == signature:
+                        continue
+                    parsed = parse_log_file(path)
+                    connection.execute("DELETE FROM log_rows WHERE path=?", (str(path),))
+                    connection.executemany("INSERT INTO log_rows(path,stamp,payload) VALUES(?,?,?)",
+                                           ((str(path), stamp, payload) for stamp, payload in parsed))
+                    connection.execute("""
+                        INSERT INTO log_files(path,signature,row_count,indexed_at) VALUES(?,?,?,?)
+                        ON CONFLICT(path) DO UPDATE SET signature=excluded.signature,
+                        row_count=excluded.row_count,indexed_at=excluded.indexed_at
+                    """, (str(path), signature, len(parsed), datetime.now(timezone.utc).isoformat()))
+                    changed += 1
+                except (OSError, PermissionError):
+                    continue
+    return changed
+
+
+def all_log_files():
+    cutoff = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    files = []
+    for hint in ("MessageTracking", "AgentLog", "ProtocolLog/SmtpReceive"):
+        files.extend(log_files(hint, cutoff))
+    return sorted(set(files))
+
+
+def background_index_once():
+    _index_state.update(running=True, lastError="")
+    try:
+        sync_sftp_logs()
+        files = all_log_files()
+        changed = index_log_files(files)
+        if changed:
+            with _cache_lock:
+                _cache.clear()
+        _index_state.update(lastSuccess=datetime.now(timezone.utc).isoformat(),
+                            files=len(files), changed=changed)
+    except Exception as exc:
+        _index_state["lastError"] = str(exc)
+    finally:
+        _index_state["running"] = False
+
+
+def background_index_loop():
+    while True:
+        background_index_once()
+        time.sleep(max(5, BACKGROUND_INDEX_SECONDS))
+
+
 def node_for_path(path):
     resolved = path.resolve()
     for node in EDGE_NODES:
@@ -221,39 +327,19 @@ def node_for_path(path):
     return EDGE_NODES[0]["name"] if EDGE_NODES else "mx"
 
 
-def read_rows(files, cutoff):
-    for path in files:
+def read_rows(hint, cutoff):
+    pattern = f"%{hint.lower().replace('\\', '/')}%"
+    with _db_lock:
+        with database() as connection:
+            stored = connection.execute(
+                "SELECT payload,stamp,path FROM log_rows "
+                "WHERE stamp>=? AND lower(replace(path, '\\', '/')) LIKE ? ORDER BY stamp",
+                (cutoff.isoformat(), pattern),
+            ).fetchall()
+    for payload, stamp_text, source_path in stored:
         try:
-            stat = path.stat()
-            signature = (stat.st_mtime_ns, stat.st_size)
-            cache_key = str(path)
-            with _row_cache_lock:
-                cached = _row_cache.get(cache_key)
-            if cached and cached[0] == signature:
-                parsed = cached[1]
-            else:
-                parsed, headers = [], None
-                with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as handle:
-                    for raw in handle:
-                        if raw.startswith("#Fields:"):
-                            headers = [part.strip() for part in raw[8:].strip().split(",")]
-                            continue
-                        if not headers or not raw.strip() or raw.startswith("#"):
-                            continue
-                        try:
-                            values = next(csv.reader([raw]))
-                            row = dict(zip(headers, values))
-                            stamp = parse_time(row.get("date-time") or row.get("Timestamp"))
-                            if stamp:
-                                parsed.append((row, stamp))
-                        except (csv.Error, ValueError):
-                            continue
-                with _row_cache_lock:
-                    _row_cache[cache_key] = (signature, parsed)
-            for row, stamp in parsed:
-                if stamp >= cutoff:
-                    yield row, stamp, str(path)
-        except (OSError, PermissionError):
+            yield json.loads(payload), datetime.fromisoformat(stamp_text), source_path
+        except (json.JSONDecodeError, ValueError):
             continue
 
 
@@ -295,11 +381,10 @@ def item(stamp, kind, sender="", recipients="", remote_ip="", subject="", status
 def build_dashboard(days):
     if not COMPANY_DOMAIN or not TRUSTED_EXCHANGE_IPS:
         raise RuntimeError("COMPANY_DOMAIN and TRUSTED_EXCHANGE_IP/TRUSTED_EXCHANGE_IPS are required")
-    sync_sftp_logs()
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     tracking = log_files("MessageTracking", cutoff)
     trusted = set()
-    for row, stamp, _ in read_rows(tracking, cutoff):
+    for row, stamp, _ in read_rows("MessageTracking", cutoff):
         if (row.get("event-id", "").upper() == "RECEIVE"
                 and row.get("directionality", "").lower() == "originating"
                 and endpoint_ip(row.get("client-ip")) in TRUSTED_EXCHANGE_IPS):
@@ -312,7 +397,7 @@ def build_dashboard(days):
     is_company_sender = lambda sender: bool(domain_re.search(text(sender).lower()))
     send_event = lambda event, connector: event == "SEND" or (event == "SENDEXTERNAL" and re.search(r"\bto\s+internet\b", connector, re.I))
 
-    for row, stamp, source_path in read_rows(tracking, cutoff):
+    for row, stamp, source_path in read_rows("MessageTracking", cutoff):
         event = row.get("event-id", "").upper()
         direction = row.get("directionality", "").lower()
         sender = text(row.get("sender-address")).lower()
@@ -369,7 +454,7 @@ def build_dashboard(days):
     agent_files = log_files("AgentLog", cutoff)
     agent_responses = set()
     reject_seen = set()
-    for row, stamp, source_path in read_rows(agent_files, cutoff):
+    for row, stamp, source_path in read_rows("AgentLog", cutoff):
         node_name = node_for_path(Path(source_path))
         action = text(row.get("Action"))
         response = text(row.get("SmtpResponse") or row.get("smtp-response"))
@@ -395,7 +480,7 @@ def build_dashboard(days):
 
     protocol_files = log_files("ProtocolLog/SmtpReceive", cutoff)
     sessions = {}
-    for row, stamp, source_path in read_rows(protocol_files, cutoff):
+    for row, stamp, source_path in read_rows("ProtocolLog/SmtpReceive", cutoff):
         node_name = node_for_path(Path(source_path))
         event, data = text(row.get("event")), text(row.get("data"))
         session = text(row.get("session-id"))
@@ -479,6 +564,7 @@ def build_dashboard(days):
                      "lastSuccess": datetime.fromtimestamp(last_success, timezone.utc).isoformat() if last_success else "",
                      "newestRecord": newest_record, "intervalSeconds": SFTP_SYNC_SECONDS,
                      "nodes": node_status},
+            "index": dict(_index_state),
             "items": records}
 
 
@@ -515,13 +601,13 @@ class Handler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/api/health":
             try:
-                sync_sftp_logs()
                 states = [{"name": node["name"], "logRootExists": node["localRoot"].is_dir(),
                            "online": (bool(_sync_state[node["name"]]["lastSuccess"]) if node["host"] else node["localRoot"].is_dir()) and not _sync_state[node["name"]]["lastError"],
                            "error": _sync_state[node["name"]]["lastError"]} for node in EDGE_NODES]
                 ok = any(state["online"] for state in states)
                 return self.send_json({"status": "ok" if ok else "error", "nodes": states,
-                                       "mode": "sftp" if any(node["host"] for node in EDGE_NODES) else "mount"}, 200 if ok else 503)
+                                       "mode": "sftp" if any(node["host"] for node in EDGE_NODES) else "mount",
+                                       "index": dict(_index_state)}, 200 if ok else 503)
             except Exception as exc:
                 return self.send_json({"status": "error", "error": str(exc), "mode": "sftp"}, 503)
         if parsed.path == "/api/dashboard":
@@ -553,4 +639,5 @@ class Handler(SimpleHTTPRequestHandler):
 
 if __name__ == "__main__":
     print(f"Exchange Edge dashboard listening on 0.0.0.0:{PORT}; nodes={','.join(node['name'] for node in EDGE_NODES)}", flush=True)
+    threading.Thread(target=background_index_loop, name="log-indexer", daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()

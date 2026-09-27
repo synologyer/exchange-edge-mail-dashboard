@@ -9,6 +9,7 @@ Exchange Server 2019 Edge Transport 日志的只读 Web 仪表盘，支持最近
 - 自动归类不存在的收件人、内容过滤、SPF/DKIM/DMARC、IP 黑名单和中继限制等拒收原因。
 - 显示 SFTP 最近成功同步时间和日志中的最新记录时间。
 - 点击记录查看完整详情，并可将当前筛选结果导出为 CSV。
+- 使用 SQLite 持久化日志索引，历史文件未改变时不再重复解析。
 
 ## 前提条件
 
@@ -70,13 +71,21 @@ services:
       EDGE_LOG_PATH: ${EDGE_LOG_PATH:-/C:/Program Files/Microsoft/Exchange Server/V15/TransportRoles/Logs}
       EDGE_HOST_KEY_SHA256: ${EDGE_HOST_KEY_SHA256:-}
       SFTP_SYNC_SECONDS: ${SFTP_SYNC_SECONDS:-60}
+      BACKGROUND_INDEX_SECONDS: ${BACKGROUND_INDEX_SECONDS:-30}
+      SFTP_HISTORY_DAYS: ${SFTP_HISTORY_DAYS:-0}
       CACHE_SECONDS: ${CACHE_SECONDS:-60}
+      DATABASE_PATH: ${DATABASE_PATH:-/data/dashboard.db}
     secrets:
       - edge_password
+    volumes:
+      - dashboard_data:/data
 
 secrets:
   edge_password:
     file: ./secrets/edge_password.txt
+
+volumes:
+  dashboard_data:
 ```
 
 `.env`：
@@ -91,6 +100,8 @@ EDGE_USERNAME=edge_log_reader
 EDGE_LOG_PATH=/C:/Program Files/Microsoft/Exchange Server/V15/TransportRoles/Logs
 EDGE_HOST_KEY_SHA256=
 SFTP_SYNC_SECONDS=10
+BACKGROUND_INDEX_SECONDS=30
+SFTP_HISTORY_DAYS=0
 CACHE_SECONDS=10
 ```
 
@@ -190,8 +201,22 @@ docker run -d \
 | `EDGE_HOST_KEY_SHA256` | 空 | 可选的 SSH 主机密钥指纹 |
 | `LOG_ROOT` | `/logs` | 本地挂载模式的日志根目录 |
 | `SFTP_SYNC_SECONDS` | `60` | 从 Edge 重新检查日志的最小间隔秒数 |
+| `BACKGROUND_INDEX_SECONDS` | `30` | 后台检查并更新 SQLite 索引的间隔秒数 |
+| `SFTP_HISTORY_DAYS` | `0` | 首次同步历史天数；`0` 表示当前保留的全部日志 |
 | `CACHE_SECONDS` | `60` | 后端缓存秒数 |
 | `MAX_ROWS` | `10000` | API 最大记录数 |
+| `DATABASE_PATH` | `/data/dashboard.db` | SQLite 持久化日志索引路径 |
+
+## 历史日志索引
+
+容器启动后会在后台静默同步所有节点当前保留的日志，并把解析结果保存到 `/data/dashboard.db`。网页的 1/7/30 天查询只读取数据库。Compose 使用 `dashboard_data` 命名卷持久化该数据库：
+
+- 文件未改变时直接查询 SQLite，不重新解析原始日志。
+- 当天仍在增长的日志文件发生变化时，只重新索引这些文件。
+- 历史日志不变时持续复用数据库索引。
+- 容器更新或重建后数据库卷继续保留。
+
+首次启动时数据会随着后台索引逐步出现。`SFTP_HISTORY_DAYS=0` 会同步 Edge 当前仍保留的全部日志；如果历史日志很多，也可以设置具体天数限制首次同步范围。
 
 ## 安全说明
 

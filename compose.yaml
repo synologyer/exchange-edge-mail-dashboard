@@ -20,12 +20,19 @@ services:
       # 首次连接后建议填写服务器主机密钥指纹，格式为不带 SHA256: 前缀的 Base64 字符串。
       EDGE_HOST_KEY_SHA256: ${EDGE_HOST_KEY_SHA256:-}
       SFTP_SYNC_SECONDS: ${SFTP_SYNC_SECONDS:-60}
+      BACKGROUND_INDEX_SECONDS: ${BACKGROUND_INDEX_SECONDS:-30}
+      SFTP_HISTORY_DAYS: ${SFTP_HISTORY_DAYS:-0}
       CACHE_SECONDS: ${CACHE_SECONDS:-60}
+      DATABASE_PATH: ${DATABASE_PATH:-/data/dashboard.db}
     secrets:
       - edge_password
     volumes:
       - ./secrets:/run/edge-secrets:ro
+      - dashboard_data:/data
 
 secrets:
   edge_password:
     file: ./secrets/edge_password.txt
+
+volumes:
+  dashboard_data:
