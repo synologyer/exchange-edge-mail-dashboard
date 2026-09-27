@@ -31,6 +31,7 @@ STATIC_ROOT = Path(__file__).parent / "static"
 MAX_ROWS = int(os.getenv("MAX_ROWS", "10000"))
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "/data/dashboard.db"))
 PARSER_VERSION = "2"
+ANALYZER_VERSION = "2"
 
 _cache = {}
 _cache_lock = threading.Lock()
@@ -244,6 +245,16 @@ def database():
             generated_at TEXT NOT NULL
         )
     """)
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS mail_events (
+            days INTEGER NOT NULL,
+            position INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            PRIMARY KEY(days, position)
+        )
+    """)
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_mail_events_type ON mail_events(days,event_type,position)")
     return connection
 
 
@@ -317,7 +328,8 @@ def background_index_once():
         files = all_log_files()
         changed = index_log_files(files)
         expected_config = {"domain": COMPANY_DOMAIN, "trustedIps": sorted(TRUSTED_EXCHANGE_IPS),
-                           "nodes": [node["name"] for node in EDGE_NODES]}
+                           "nodes": [node["name"] for node in EDGE_NODES],
+                           "analyzerVersion": ANALYZER_VERSION}
         with _db_lock:
             with database() as connection:
                 saved_snapshots = connection.execute("SELECT days,payload FROM dashboard_snapshots").fetchall()
@@ -333,12 +345,20 @@ def background_index_once():
             with _db_lock:
                 with database() as connection:
                     now_text = datetime.now(timezone.utc).isoformat()
-                    connection.executemany(
-                        "INSERT INTO dashboard_snapshots(days,payload,generated_at) VALUES(?,?,?) "
-                        "ON CONFLICT(days) DO UPDATE SET payload=excluded.payload,generated_at=excluded.generated_at",
-                        ((days, json.dumps(payload, ensure_ascii=False), now_text)
-                         for days, payload in snapshots.items()),
-                    )
+                    for days, payload in snapshots.items():
+                        events = payload.pop("items", [])
+                        connection.execute("DELETE FROM mail_events WHERE days=?", (days,))
+                        connection.executemany(
+                            "INSERT INTO mail_events(days,position,event_type,payload) VALUES(?,?,?,?)",
+                            ((days, position, event["type"], json.dumps(event, ensure_ascii=False))
+                             for position, event in enumerate(events)),
+                        )
+                        payload["totalEvents"] = len(events)
+                        connection.execute(
+                            "INSERT INTO dashboard_snapshots(days,payload,generated_at) VALUES(?,?,?) "
+                            "ON CONFLICT(days) DO UPDATE SET payload=excluded.payload,generated_at=excluded.generated_at",
+                            (days, json.dumps(payload, ensure_ascii=False), now_text),
+                        )
             with _cache_lock:
                 _cache.clear()
         _index_state.update(lastSuccess=datetime.now(timezone.utc).isoformat(),
@@ -368,13 +388,12 @@ def node_for_path(path):
 
 def read_rows(hint, cutoff):
     pattern = f"%{hint.lower().replace('\\', '/')}%"
-    with _db_lock:
-        with database() as connection:
-            stored = connection.execute(
-                "SELECT payload,stamp,path FROM log_rows "
-                "WHERE stamp>=? AND lower(replace(path, '\\', '/')) LIKE ? ORDER BY stamp",
-                (cutoff.isoformat(), pattern),
-            ).fetchall()
+    with database() as connection:
+        stored = connection.execute(
+            "SELECT payload,stamp,path FROM log_rows "
+            "WHERE stamp>=? AND lower(replace(path, '\\', '/')) LIKE ? ORDER BY stamp",
+            (cutoff.isoformat(), pattern),
+        ).fetchall()
     for payload, stamp_text, source_path in stored:
         try:
             yield json.loads(payload), datetime.fromisoformat(stamp_text), source_path
@@ -385,18 +404,23 @@ def read_rows(hint, cutoff):
 def raw_log_page(days, page=1, page_size=500):
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     page = max(1, page)
-    page_size = min(1000, max(50, page_size))
-    where = "stamp>=? OR stamp=''"
-    with _db_lock:
-        with database() as connection:
-            total = connection.execute(f"SELECT count(*) FROM log_rows WHERE {where}",
-                                       (cutoff.isoformat(),)).fetchone()[0]
-            failed = connection.execute("SELECT count(*) FROM log_rows WHERE stamp=''", ()).fetchone()[0]
-            rows = connection.execute(
-                f"SELECT payload,stamp,path FROM log_rows WHERE {where} "
-                "ORDER BY CASE WHEN stamp='' THEN 1 ELSE 0 END, stamp DESC LIMIT ? OFFSET ?",
-                (cutoff.isoformat(), page_size, (page - 1) * page_size),
-            ).fetchall()
+    page_size = min(500, max(50, page_size))
+    offset = (page - 1) * page_size
+    with database() as connection:
+        dated = connection.execute("SELECT count(*) FROM log_rows WHERE stamp>=?",
+                                   (cutoff.isoformat(),)).fetchone()[0]
+        failed = connection.execute("SELECT count(*) FROM log_rows WHERE stamp=''", ()).fetchone()[0]
+        total = dated + failed
+        rows = connection.execute(
+            "SELECT payload,stamp,path FROM log_rows WHERE stamp>=? ORDER BY stamp DESC LIMIT ? OFFSET ?",
+            (cutoff.isoformat(), page_size, offset),
+        ).fetchall() if offset < dated else []
+        if len(rows) < page_size and offset + len(rows) >= dated:
+            failed_offset = max(0, offset - dated)
+            rows.extend(connection.execute(
+                "SELECT payload,stamp,path FROM log_rows WHERE stamp='' ORDER BY path LIMIT ? OFFSET ?",
+                (page_size - len(rows), failed_offset),
+            ).fetchall())
     items = []
     for payload, stamp_text, source_path in rows:
         try:
@@ -425,6 +449,28 @@ def raw_log_page(days, page=1, page_size=500):
         items[-1]["rawData"] = row
     return {"days": days, "page": page, "pageSize": page_size, "total": total,
             "parseErrors": failed, "items": items}
+
+
+def event_page(days, page=1, page_size=200, event_filter=""):
+    page = max(1, page)
+    page_size = min(500, max(50, page_size))
+    filters = {
+        "收件": ("event_type=?", ("收件",)), "发件": ("event_type=?", ("发件",)),
+        "拒收": ("event_type=?", ("拒收",)), "外发失败": ("event_type=?", ("外发失败",)),
+        "spoofed": ("event_type LIKE ?", ("匿名冒充公司域%",)),
+        "system": ("event_type LIKE ?", ("系统退信%",)),
+        "anomaly": ("event_type LIKE ?", ("异常发件人%",)),
+    }
+    clause, args = filters.get(event_filter, ("1=1", ()))
+    with database() as connection:
+        total = connection.execute(f"SELECT count(*) FROM mail_events WHERE days=? AND {clause}",
+                                   (days, *args)).fetchone()[0]
+        rows = connection.execute(
+            f"SELECT payload FROM mail_events WHERE days=? AND {clause} ORDER BY position LIMIT ? OFFSET ?",
+            (days, *args, page_size, (page - 1) * page_size),
+        ).fetchall()
+    return {"days": days, "page": page, "pageSize": page_size, "total": total,
+            "items": [json.loads(row[0]) for row in rows]}
 
 
 def endpoint_ip(value):
@@ -641,7 +687,8 @@ def analyze_dashboard(days):
     last_success = max((state["lastSuccess"] for state in _sync_state.values()), default=0)
     return {"generatedAt": datetime.now(timezone.utc).isoformat(), "days": days,
             "config": {"domain": COMPANY_DOMAIN, "trustedIps": sorted(TRUSTED_EXCHANGE_IPS),
-                       "nodes": [node["name"] for node in EDGE_NODES]},
+                       "nodes": [node["name"] for node in EDGE_NODES],
+                       "analyzerVersion": ANALYZER_VERSION},
             "files": {"tracking": len(tracking), "agent": len(agent_files), "protocol": len(protocol_files)},
             "trustedMessages": len(trusted), "counts": counts, "daily": daily, "hourly": hourly,
             "sync": {"mode": "sftp" if any(node["host"] for node in EDGE_NODES) else "mount",
@@ -666,14 +713,15 @@ def empty_dashboard(days):
                   for offset in range(23, -1, -1)]
     return {"generatedAt": datetime.now(timezone.utc).isoformat(), "days": days,
             "config": {"domain": COMPANY_DOMAIN, "trustedIps": sorted(TRUSTED_EXCHANGE_IPS),
-                       "nodes": [node["name"] for node in EDGE_NODES]},
+                       "nodes": [node["name"] for node in EDGE_NODES],
+                       "analyzerVersion": ANALYZER_VERSION},
             "files": {"tracking": 0, "agent": 0, "protocol": 0}, "trustedMessages": 0,
             "counts": {"inbound": 0, "outbound": 0, "rejected": 0, "failed": 0,
                        "systemNdr": 0, "anomaly": 0, "spoofed": 0},
             "daily": daily, "hourly": hourly,
             "sync": {"mode": "sftp" if any(node["host"] for node in EDGE_NODES) else "mount",
                      "lastSuccess": "", "newestRecord": "", "intervalSeconds": SFTP_SYNC_SECONDS,
-                     "nodes": []}, "items": []}
+                     "nodes": []}, "totalEvents": 0}
 
 
 def dashboard(days):
@@ -688,10 +736,14 @@ def dashboard(days):
             cached = _cache.get(days)
             if cached and now - cached[0] < CACHE_SECONDS:
                 return cached[1]
-        with _db_lock:
-            with database() as connection:
-                row = connection.execute("SELECT payload FROM dashboard_snapshots WHERE days=?", (days,)).fetchone()
+        with database() as connection:
+            row = connection.execute("SELECT payload FROM dashboard_snapshots WHERE days=?", (days,)).fetchone()
         result = json.loads(row[0]) if row else empty_dashboard(days)
+        expected_config = {"domain": COMPANY_DOMAIN, "trustedIps": sorted(TRUSTED_EXCHANGE_IPS),
+                           "nodes": [node["name"] for node in EDGE_NODES],
+                           "analyzerVersion": ANALYZER_VERSION}
+        if result.get("config") != expected_config:
+            result = empty_dashboard(days)
         result["generatedAt"] = datetime.now(timezone.utc).isoformat()
         result["index"] = dict(_index_state)
         with _cache_lock:
@@ -742,6 +794,20 @@ class Handler(SimpleHTTPRequestHandler):
                 if days not in (1, 7, 30):
                     raise ValueError
                 return self.send_json(raw_log_page(days, page, page_size))
+            except ValueError:
+                return self.send_json({"error": "invalid days, page or pageSize"}, 400)
+            except Exception as exc:
+                return self.send_json({"error": str(exc)}, 500)
+        if parsed.path == "/api/events":
+            try:
+                query = parse_qs(parsed.query)
+                days = int(query.get("days", ["1"])[0])
+                page = int(query.get("page", ["1"])[0])
+                page_size = int(query.get("pageSize", ["200"])[0])
+                event_filter = query.get("type", [""])[0]
+                if days not in (1, 7, 30):
+                    raise ValueError
+                return self.send_json(event_page(days, page, page_size, event_filter))
             except ValueError:
                 return self.send_json({"error": "invalid days, page or pageSize"}, 400)
             except Exception as exc:
