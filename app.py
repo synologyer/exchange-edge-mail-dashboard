@@ -401,6 +401,38 @@ def read_rows(hint, cutoff):
             continue
 
 
+def classify_raw_log(source, event, pick, parse_error):
+    if parse_error:
+        return "解析异常", "无法解析的原始日志行", "需要检查", "warn"
+    event_upper = event.upper()
+    direction = text(pick("directionality")).lower()
+    connector = text(pick("connector-id", "connector"))
+    agent = text(pick("agent", "source-context"))
+    action = text(pick("action"))
+    reason = text(pick("reason", "recipient-status", "smtp-response"))
+    response = " ".join((reason, text(pick("smtp-response")), text(pick("source-context")))).lower()
+    recipient_missing = ("recipientdoesnotexist" in response or "recipientnotfound" in response
+                         or "recipient not found" in response)
+    rejected = action.lower().startswith("reject") or re.match(r"^[45]\d\d", response.strip())
+    if recipient_missing:
+        return "拒收", "收件人不存在，已被 Edge 拒绝", "已成功拦截", "ok"
+    if rejected or (event_upper == "FAIL" and "recipient filter agent" in agent.lower()):
+        return "拒收", rejection_category(response, reason), "已拦截", "ok"
+    inbound_handoff = (event_upper == "SENDEXTERNAL" and direction == "incoming"
+                       and "edgesync" in connector.lower() and "inbound" in connector.lower())
+    if inbound_handoff and ("250 2." in response or "queued mail for delivery" in response):
+        return "收件", "外部来信已转交内部 Mail 服务器", "已接收并进入投递队列", "ok"
+    if event_upper == "RECEIVE" and direction == "incoming":
+        return "收件", "外部来信已由 Edge 接收", "已接收", "ok"
+    if event_upper in ("SEND", "SENDEXTERNAL") and direction == "originating":
+        return "发件", "公司邮件正常外发", "已发送", "ok"
+    if event_upper == "FAIL":
+        return "传输失败", "邮件传输失败", "失败", "bad"
+    if source == "AgentLog" and action:
+        return "代理处理", f"{agent or '传输代理'}：{action}", "已处理", "ok"
+    return event or "其他日志", "原始日志记录", "仅供审计", "neutral"
+
+
 def raw_log_page(days, page=1, page_size=500):
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     page = max(1, page)
@@ -435,17 +467,20 @@ def raw_log_page(days, page=1, page_size=500):
             "AgentLog" if "agentlog" in path_lower else "SmtpReceive")
         event = text(pick("event-id", "event", "action", "agent"))
         parse_error = text(pick("_parseError"))
+        kind, category, result_text, result_class = classify_raw_log(source, event, pick, parse_error)
         items.append(item(
             parse_time(stamp_text) if stamp_text else datetime(1970, 1, 1, tzinfo=timezone.utc),
-            "解析异常" if parse_error else (event or "其他日志"),
+            kind,
             pick("sender-address", "p1-from-address", "p2-from-address", "mail-from"),
-            pick("recipient-address", "recipients", "rcpt-to"),
-            pick("client-ip", "remote-endpoint", "ip-address"),
+            pick("recipient-address", "recipient", "recipients", "rcpt-to"),
+            endpoint_ip(pick("client-ip", "remote-endpoint", "ip-address")),
             pick("message-subject", "subject"), event,
             parse_error or pick("recipient-status", "smtp-response", "reason", "_raw"),
-            source, "原始日志记录" if not parse_error else "无法解析的原始日志行",
+            source, category,
             pick("connector-id", "connector", "agent"), node_for_path(Path(source_path)),
         ))
+        items[-1]["resultText"] = result_text
+        items[-1]["resultClass"] = result_class
         items[-1]["rawData"] = row
     return {"days": days, "page": page, "pageSize": page_size, "total": total,
             "parseErrors": failed, "items": items}
