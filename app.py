@@ -38,6 +38,7 @@ _cache = {}
 _cache_lock = threading.Lock()
 _sftp_lock = threading.Lock()
 _last_sftp_sync = 0.0
+_last_sftp_error = ""
 
 
 def secret_password():
@@ -55,7 +56,7 @@ def verify_host_key(key):
 
 
 def sync_sftp_logs(force=False):
-    global _last_sftp_sync
+    global _last_sftp_sync, _last_sftp_error
     if not SFTP_HOST:
         return
     if paramiko is None:
@@ -105,6 +106,10 @@ def sync_sftp_logs(force=False):
 
             list(walk(SFTP_ROOT, is_root=True))
             _last_sftp_sync = now
+            _last_sftp_error = ""
+        except Exception as exc:
+            _last_sftp_error = str(exc)
+            raise
         finally:
             transport.close()
 
@@ -189,11 +194,38 @@ def read_rows(files, cutoff):
             continue
 
 
-def item(stamp, kind, sender="", recipients="", remote_ip="", subject="", status="", reason="", source=""):
+def endpoint_ip(value):
+    value = text(value).strip("[]")
+    if value.startswith("[") and "]:" in value:
+        return value[1:value.rfind("]")]
+    if value.count(":") == 1:
+        return value.rsplit(":", 1)[0]
+    return value
+
+
+def rejection_category(status, reason=""):
+    value = f"{text(status)} {text(reason)}".lower()
+    if re.search(r"5\.1\.1|recipientnotfound|user unknown|unknown recipient|resolver\.adr\.recipnotfound", value):
+        return "不存在的收件人"
+    if re.search(r"spam|content filter|scl|malware|phish", value):
+        return "垃圾邮件或内容过滤"
+    if re.search(r"spf|dkim|dmarc", value):
+        return "身份验证策略"
+    if re.search(r"blocklist|blacklist|rbl|dnsbl", value):
+        return "IP 黑名单"
+    if re.search(r"relay|unable to relay|not permitted", value):
+        return "中继限制"
+    if re.match(r"\s*4\d\d", value):
+        return "临时失败"
+    return "其他拒收"
+
+
+def item(stamp, kind, sender="", recipients="", remote_ip="", subject="", status="", reason="", source="", category="", connector=""):
     return {
         "time": stamp.isoformat(), "type": kind, "sender": text(sender),
         "recipients": text(recipients), "remoteIp": text(remote_ip),
         "subject": text(subject), "status": text(status), "reason": text(reason), "source": source,
+        "category": text(category), "connector": text(connector),
     }
 
 
@@ -214,6 +246,7 @@ def build_dashboard(days):
 
     records, seen = [], defaultdict(set)
     domain_re = re.compile(r"@(?:[^@]+\.)?" + re.escape(COMPANY_DOMAIN) + r"$", re.I)
+    is_company_sender = lambda sender: bool(domain_re.search(text(sender).lower()))
     send_event = lambda event, connector: event == "SEND" or (event == "SENDEXTERNAL" and re.search(r"\bto\s+internet\b", connector, re.I))
 
     for row, stamp, _ in read_rows(tracking, cutoff):
@@ -225,7 +258,8 @@ def build_dashboard(days):
         system_sender = not sender or sender == "<>" or sender.startswith("postmaster@") or sender.startswith("microsoftexchange")
         kind = None
         if event == "RECEIVE" and direction == "incoming":
-            kind = "收件"
+            remote_ip = endpoint_ip(row.get("client-ip"))
+            kind = "匿名冒充公司域" if is_company_sender(sender) and remote_ip != TRUSTED_EXCHANGE_IP else "收件"
         elif direction == "originating" and trusted_out and send_event(event, connector):
             if system_sender:
                 kind = "系统退信"
@@ -249,7 +283,8 @@ def build_dashboard(days):
         records.append(item(
             stamp, kind, row.get("sender-address"), row.get("recipient-address"),
             row.get("client-ip") if direction == "incoming" else row.get("server-ip"),
-            row.get("message-subject"), event, row.get("recipient-status"), "MessageTracking"
+            row.get("message-subject"), event, row.get("recipient-status"), "MessageTracking",
+            "外部连接声称使用公司域发件人" if kind == "匿名冒充公司域" else "", connector
         ))
 
     agent_files = log_files("AgentLog", cutoff)
@@ -271,9 +306,12 @@ def build_dashboard(days):
         reject_seen.add(key)
         reason = " ".join(filter(None, (text(row.get("Reason")), text(row.get("ReasonData")))))
         sender = row.get("P1FromAddress") or row.get("P2FromAddresses")
-        records.append(item(stamp, "拒收", sender, recipient,
-                            row.get("RemoteEndpoint") or row.get("remote-endpoint"),
-                            "", response or action, reason, "AgentLog"))
+        remote = row.get("RemoteEndpoint") or row.get("remote-endpoint")
+        kind = "匿名冒充公司域（已拒收）" if is_company_sender(sender) and endpoint_ip(remote) != TRUSTED_EXCHANGE_IP else "拒收"
+        category = "外部连接声称使用公司域发件人" if kind.startswith("匿名冒充") else rejection_category(response or action, reason)
+        records.append(item(stamp, kind, sender, recipient, remote,
+                            "", response or action, reason, "AgentLog", category,
+                            row.get("Agent")))
 
     protocol_files = log_files("ProtocolLog/SmtpReceive", cutoff)
     sessions = {}
@@ -299,8 +337,13 @@ def build_dashboard(days):
             continue
         reject_seen.add(key)
         state = sessions.get(session, {})
-        records.append(item(stamp, "拒收", state.get("sender"), state.get("recipient"),
-                            row.get("remote-endpoint"), "", data, row.get("context"), "SmtpReceive"))
+        sender = state.get("sender")
+        remote = row.get("remote-endpoint")
+        kind = "匿名冒充公司域（已拒收）" if is_company_sender(sender) and endpoint_ip(remote) != TRUSTED_EXCHANGE_IP else "拒收"
+        category = "外部连接声称使用公司域发件人" if kind.startswith("匿名冒充") else rejection_category(data, row.get("context"))
+        records.append(item(stamp, kind, sender, state.get("recipient"),
+                            remote, "", data, row.get("context"), "SmtpReceive", category,
+                            row.get("connector-id")))
 
     records.sort(key=lambda row: row["time"], reverse=True)
     if len(records) > MAX_ROWS:
@@ -312,6 +355,7 @@ def build_dashboard(days):
         "failed": sum(r["type"] == "外发失败" for r in records),
         "systemNdr": sum(r["type"].startswith("系统退信") for r in records),
         "anomaly": sum(r["type"].startswith("异常发件人") for r in records),
+        "spoofed": sum(r["type"].startswith("匿名冒充公司域") for r in records),
     }
     daily = []
     local_now = datetime.now().astimezone()
@@ -320,11 +364,30 @@ def build_dashboard(days):
         subset = [r for r in records if datetime.fromisoformat(r["time"]).astimezone().date() == day]
         daily.append({"date": day.isoformat(), "inbound": sum(r["type"] == "收件" for r in subset),
                       "outbound": sum(r["type"] == "发件" for r in subset),
-                      "rejected": sum(r["type"] == "拒收" for r in subset)})
+                      "rejected": sum(r["type"] == "拒收" for r in subset),
+                      "spoofed": sum(r["type"].startswith("匿名冒充公司域") for r in subset)})
+    hourly = []
+    if days == 1:
+        local_now = datetime.now().astimezone().replace(minute=0, second=0, microsecond=0)
+        for offset in range(23, -1, -1):
+            start = local_now - timedelta(hours=offset)
+            end = start + timedelta(hours=1)
+            subset = [r for r in records if start <= datetime.fromisoformat(r["time"]).astimezone() < end]
+            hourly.append({"time": start.isoformat(), "label": start.strftime("%H:00"),
+                           "inbound": sum(r["type"] == "收件" for r in subset),
+                           "outbound": sum(r["type"] == "发件" for r in subset),
+                           "rejected": sum(r["type"] == "拒收" for r in subset),
+                           "spoofed": sum(r["type"].startswith("匿名冒充公司域") for r in subset)})
+    newest_record = records[0]["time"] if records else ""
     return {"generatedAt": datetime.now(timezone.utc).isoformat(), "days": days,
             "config": {"domain": COMPANY_DOMAIN, "trustedIp": TRUSTED_EXCHANGE_IP, "logRoot": str(LOG_ROOT)},
             "files": {"tracking": len(tracking), "agent": len(agent_files), "protocol": len(protocol_files)},
-            "trustedMessages": len(trusted), "counts": counts, "daily": daily, "items": records}
+            "trustedMessages": len(trusted), "counts": counts, "daily": daily, "hourly": hourly,
+            "sync": {"mode": "sftp" if SFTP_HOST else "mount",
+                     "lastSuccess": datetime.fromtimestamp(_last_sftp_sync, timezone.utc).isoformat() if _last_sftp_sync else "",
+                     "lastError": _last_sftp_error, "newestRecord": newest_record,
+                     "intervalSeconds": SFTP_SYNC_SECONDS if SFTP_HOST else 0},
+            "items": records}
 
 
 def dashboard(days):
