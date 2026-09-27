@@ -31,7 +31,7 @@ STATIC_ROOT = Path(__file__).parent / "static"
 MAX_ROWS = int(os.getenv("MAX_ROWS", "10000"))
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "/data/dashboard.db"))
 PARSER_VERSION = "2"
-ANALYZER_VERSION = "2"
+ANALYZER_VERSION = "3"
 
 _cache = {}
 _cache_lock = threading.Lock()
@@ -409,15 +409,15 @@ def classify_raw_log(source, event, pick, parse_error):
     connector = text(pick("connector-id", "connector"))
     agent = text(pick("agent", "source-context"))
     action = text(pick("action"))
-    reason = text(pick("reason", "recipient-status", "smtp-response"))
-    response = " ".join((reason, text(pick("smtp-response")), text(pick("source-context")))).lower()
-    recipient_missing = ("recipientdoesnotexist" in response or "recipientnotfound" in response
-                         or "recipient not found" in response)
+    reason = text(pick("reason", "recipient-status", "smtp-response", "smtpresponse"))
+    response = " ".join((reason, text(pick("smtp-response", "smtpresponse")),
+                         text(pick("source-context", "sourcecontext")))).lower()
+    recipient_missing = is_missing_recipient(response)
     rejected = action.lower().startswith("reject") or re.match(r"^[45]\d\d", response.strip())
     if recipient_missing:
-        return "拒收", "收件人不存在，已被 Edge 拒绝", "已成功拦截", "ok"
+        return "无效邮箱投递", "收件人不存在，已被 Edge 拒绝", "已成功拦截", "ok"
     if rejected or (event_upper == "FAIL" and "recipient filter agent" in agent.lower()):
-        return "拒收", rejection_category(response, reason), "已拦截", "ok"
+        return "已有邮箱邮件被拒", rejection_category(response, reason), "已拦截", "ok"
     inbound_handoff = (event_upper == "SENDEXTERNAL" and direction == "incoming"
                        and "edgesync" in connector.lower() and "inbound" in connector.lower())
     if inbound_handoff and ("250 2." in response or "queued mail for delivery" in response):
@@ -491,7 +491,10 @@ def event_page(days, page=1, page_size=200, event_filter=""):
     page_size = min(500, max(50, page_size))
     filters = {
         "收件": ("event_type=?", ("收件",)), "发件": ("event_type=?", ("发件",)),
-        "拒收": ("event_type=?", ("拒收",)), "外发失败": ("event_type=?", ("外发失败",)),
+        "拒收": ("event_type IN (?,?)", ("已有邮箱邮件被拒", "无效邮箱投递")),
+        "valid-rejected": ("event_type=?", ("已有邮箱邮件被拒",)),
+        "invalid-recipient": ("event_type=?", ("无效邮箱投递",)),
+        "外发失败": ("event_type=?", ("外发失败",)),
         "spoofed": ("event_type LIKE ?", ("匿名冒充公司域%",)),
         "system": ("event_type LIKE ?", ("系统退信%",)),
         "anomaly": ("event_type LIKE ?", ("异常发件人%",)),
@@ -517,9 +520,18 @@ def endpoint_ip(value):
     return value
 
 
+def is_missing_recipient(value):
+    value = text(value).lower()
+    return bool(re.search(
+        r"5\.1\.1|5\.1\.10|recipientdoesnotexist|recipientnotfound|recipient not found|"
+        r"recipientnotfound|unknown recipient|user unknown|unknown user|no such user|"
+        r"resolver\.adr\.(?:recipnotfound|recipientnotfound)", value
+    ))
+
+
 def rejection_category(status, reason=""):
     value = f"{text(status)} {text(reason)}".lower()
-    if re.search(r"5\.1\.1|recipientnotfound|user unknown|unknown recipient|resolver\.adr\.recipnotfound", value):
+    if is_missing_recipient(value):
         return "不存在的收件人"
     if re.search(r"spam|content filter|scl|malware|phish", value):
         return "垃圾邮件或内容过滤"
@@ -637,7 +649,12 @@ def analyze_dashboard(days):
         reason = " ".join(filter(None, (text(row.get("Reason")), text(row.get("ReasonData")))))
         sender = row.get("P1FromAddress") or row.get("P2FromAddresses")
         remote = row.get("RemoteEndpoint") or row.get("remote-endpoint")
-        kind = "匿名冒充公司域（已拒收）" if is_company_sender(sender) and endpoint_ip(remote) not in TRUSTED_EXCHANGE_IPS else "拒收"
+        if is_company_sender(sender) and endpoint_ip(remote) not in TRUSTED_EXCHANGE_IPS:
+            kind = "匿名冒充公司域（已拒收）"
+        elif is_missing_recipient(f"{response} {reason}"):
+            kind = "无效邮箱投递"
+        else:
+            kind = "已有邮箱邮件被拒"
         category = "外部连接冒充公司域发件人" if kind.startswith("匿名冒充") else rejection_category(response or action, reason)
         records.append(item(stamp, kind, sender, recipient, remote,
                             "", response or action, reason, "AgentLog", category,
@@ -671,7 +688,12 @@ def analyze_dashboard(days):
         state = sessions.get(session_key, {})
         sender = state.get("sender")
         remote = row.get("remote-endpoint")
-        kind = "匿名冒充公司域（已拒收）" if is_company_sender(sender) and endpoint_ip(remote) not in TRUSTED_EXCHANGE_IPS else "拒收"
+        if is_company_sender(sender) and endpoint_ip(remote) not in TRUSTED_EXCHANGE_IPS:
+            kind = "匿名冒充公司域（已拒收）"
+        elif is_missing_recipient(f"{data} {row.get('context')}"):
+            kind = "无效邮箱投递"
+        else:
+            kind = "已有邮箱邮件被拒"
         category = "外部连接冒充公司域发件人" if kind.startswith("匿名冒充") else rejection_category(data, row.get("context"))
         records.append(item(stamp, kind, sender, state.get("recipient"),
                             remote, "", data, row.get("context"), "SmtpReceive", category,
@@ -683,7 +705,7 @@ def analyze_dashboard(days):
     counts = {
         "inbound": sum(r["type"] == "收件" for r in records),
         "outbound": sum(r["type"] == "发件" for r in records),
-        "rejected": sum(r["type"] == "拒收" for r in records),
+        "rejected": sum(r["type"] in ("已有邮箱邮件被拒", "无效邮箱投递") for r in records),
         "failed": sum(r["type"] == "外发失败" for r in records),
         "systemNdr": sum(r["type"].startswith("系统退信") for r in records),
         "anomaly": sum(r["type"].startswith("异常发件人") for r in records),
@@ -696,7 +718,7 @@ def analyze_dashboard(days):
         subset = [r for r in records if datetime.fromisoformat(r["time"]).astimezone().date() == day]
         daily.append({"date": day.isoformat(), "inbound": sum(r["type"] == "收件" for r in subset),
                       "outbound": sum(r["type"] == "发件" for r in subset),
-                      "rejected": sum(r["type"] == "拒收" for r in subset),
+                      "rejected": sum(r["type"] in ("已有邮箱邮件被拒", "无效邮箱投递") for r in subset),
                       "spoofed": sum(r["type"].startswith("匿名冒充公司域") for r in subset)})
     hourly = []
     if days == 1:
@@ -708,7 +730,7 @@ def analyze_dashboard(days):
             hourly.append({"time": start.isoformat(), "label": start.strftime("%H:00"),
                            "inbound": sum(r["type"] == "收件" for r in subset),
                            "outbound": sum(r["type"] == "发件" for r in subset),
-                           "rejected": sum(r["type"] == "拒收" for r in subset),
+                           "rejected": sum(r["type"] in ("已有邮箱邮件被拒", "无效邮箱投递") for r in subset),
                            "spoofed": sum(r["type"].startswith("匿名冒充公司域") for r in subset)})
     newest_record = records[0]["time"] if records else ""
     node_status = []
