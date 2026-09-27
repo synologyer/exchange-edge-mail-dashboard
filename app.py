@@ -30,6 +30,7 @@ CACHE_SECONDS = int(os.getenv("CACHE_SECONDS", "60"))
 STATIC_ROOT = Path(__file__).parent / "static"
 MAX_ROWS = int(os.getenv("MAX_ROWS", "10000"))
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "/data/dashboard.db"))
+PARSER_VERSION = "2"
 
 _cache = {}
 _cache_lock = threading.Lock()
@@ -236,26 +237,42 @@ def database():
     """)
     connection.execute("CREATE INDEX IF NOT EXISTS idx_log_rows_stamp ON log_rows(stamp)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_log_rows_path ON log_rows(path)")
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS dashboard_snapshots (
+            days INTEGER PRIMARY KEY,
+            payload TEXT NOT NULL,
+            generated_at TEXT NOT NULL
+        )
+    """)
     return connection
 
 
 def parse_log_file(path):
     parsed, headers = [], None
+    line_number = 0
     with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as handle:
         for raw in handle:
             if raw.startswith("#Fields:"):
                 headers = [part.strip() for part in raw[8:].strip().split(",")]
                 continue
-            if not headers or not raw.strip() or raw.startswith("#"):
+            if not raw.strip() or raw.startswith("#"):
+                continue
+            line_number += 1
+            if not headers:
+                parsed.append(("", json.dumps({"_line": line_number, "_raw": raw.rstrip("\r\n"),
+                                                  "_parseError": "日志缺少 #Fields 字段定义"}, ensure_ascii=False)))
                 continue
             try:
                 values = next(csv.reader([raw]))
                 row = dict(zip(headers, values))
                 stamp = parse_time(row.get("date-time") or row.get("Timestamp"))
-                if stamp:
-                    parsed.append((stamp.isoformat(), json.dumps(row, ensure_ascii=False)))
-            except (csv.Error, ValueError):
-                continue
+                row["_line"] = line_number
+                if len(values) != len(headers):
+                    row["_parseError"] = f"字段数量不一致：应为 {len(headers)}，实际为 {len(values)}"
+                parsed.append((stamp.isoformat() if stamp else "", json.dumps(row, ensure_ascii=False)))
+            except (csv.Error, ValueError) as exc:
+                parsed.append(("", json.dumps({"_line": line_number, "_raw": raw.rstrip("\r\n"),
+                                                  "_parseError": str(exc)}, ensure_ascii=False)))
     return parsed
 
 
@@ -266,7 +283,7 @@ def index_log_files(files):
             for path in files:
                 try:
                     stat = path.stat()
-                    signature = f"{stat.st_mtime_ns}:{stat.st_size}"
+                    signature = f"v{PARSER_VERSION}:{stat.st_mtime_ns}:{stat.st_size}"
                     current = connection.execute("SELECT signature FROM log_files WHERE path=?", (str(path),)).fetchone()
                     if current and current[0] == signature:
                         continue
@@ -299,7 +316,29 @@ def background_index_once():
         sync_sftp_logs()
         files = all_log_files()
         changed = index_log_files(files)
-        if changed:
+        expected_config = {"domain": COMPANY_DOMAIN, "trustedIps": sorted(TRUSTED_EXCHANGE_IPS),
+                           "nodes": [node["name"] for node in EDGE_NODES]}
+        with _db_lock:
+            with database() as connection:
+                saved_snapshots = connection.execute("SELECT days,payload FROM dashboard_snapshots").fetchall()
+        snapshot_days = set()
+        for days, payload in saved_snapshots:
+            try:
+                if json.loads(payload).get("config") == expected_config:
+                    snapshot_days.add(days)
+            except json.JSONDecodeError:
+                pass
+        if changed or snapshot_days != {1, 7, 30}:
+            snapshots = {days: analyze_dashboard(days) for days in (1, 7, 30)}
+            with _db_lock:
+                with database() as connection:
+                    now_text = datetime.now(timezone.utc).isoformat()
+                    connection.executemany(
+                        "INSERT INTO dashboard_snapshots(days,payload,generated_at) VALUES(?,?,?) "
+                        "ON CONFLICT(days) DO UPDATE SET payload=excluded.payload,generated_at=excluded.generated_at",
+                        ((days, json.dumps(payload, ensure_ascii=False), now_text)
+                         for days, payload in snapshots.items()),
+                    )
             with _cache_lock:
                 _cache.clear()
         _index_state.update(lastSuccess=datetime.now(timezone.utc).isoformat(),
@@ -343,6 +382,51 @@ def read_rows(hint, cutoff):
             continue
 
 
+def raw_log_page(days, page=1, page_size=500):
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    page = max(1, page)
+    page_size = min(1000, max(50, page_size))
+    where = "stamp>=? OR stamp=''"
+    with _db_lock:
+        with database() as connection:
+            total = connection.execute(f"SELECT count(*) FROM log_rows WHERE {where}",
+                                       (cutoff.isoformat(),)).fetchone()[0]
+            failed = connection.execute("SELECT count(*) FROM log_rows WHERE stamp=''", ()).fetchone()[0]
+            rows = connection.execute(
+                f"SELECT payload,stamp,path FROM log_rows WHERE {where} "
+                "ORDER BY CASE WHEN stamp='' THEN 1 ELSE 0 END, stamp DESC LIMIT ? OFFSET ?",
+                (cutoff.isoformat(), page_size, (page - 1) * page_size),
+            ).fetchall()
+    items = []
+    for payload, stamp_text, source_path in rows:
+        try:
+            row = json.loads(payload)
+        except json.JSONDecodeError:
+            row = {"_raw": payload, "_parseError": "数据库记录不是有效 JSON"}
+        normalized = {str(key).lower(): value for key, value in row.items()}
+        pick = lambda *names: next((normalized[name.lower()] for name in names
+                                    if normalized.get(name.lower()) not in (None, "")), "")
+        path_lower = source_path.lower().replace("\\", "/")
+        source = "MessageTracking" if "messagetracking" in path_lower else (
+            "AgentLog" if "agentlog" in path_lower else "SmtpReceive")
+        event = text(pick("event-id", "event", "action", "agent"))
+        parse_error = text(pick("_parseError"))
+        items.append(item(
+            parse_time(stamp_text) if stamp_text else datetime(1970, 1, 1, tzinfo=timezone.utc),
+            "解析异常" if parse_error else (event or "其他日志"),
+            pick("sender-address", "p1-from-address", "p2-from-address", "mail-from"),
+            pick("recipient-address", "recipients", "rcpt-to"),
+            pick("client-ip", "remote-endpoint", "ip-address"),
+            pick("message-subject", "subject"), event,
+            parse_error or pick("recipient-status", "smtp-response", "reason", "_raw"),
+            source, "原始日志记录" if not parse_error else "无法解析的原始日志行",
+            pick("connector-id", "connector", "agent"), node_for_path(Path(source_path)),
+        ))
+        items[-1]["rawData"] = row
+    return {"days": days, "page": page, "pageSize": page_size, "total": total,
+            "parseErrors": failed, "items": items}
+
+
 def endpoint_ip(value):
     value = text(value).strip("[]")
     if value.startswith("[") and "]:" in value:
@@ -378,7 +462,7 @@ def item(stamp, kind, sender="", recipients="", remote_ip="", subject="", status
     }
 
 
-def build_dashboard(days):
+def analyze_dashboard(days):
     if not COMPANY_DOMAIN or not TRUSTED_EXCHANGE_IPS:
         raise RuntimeError("COMPANY_DOMAIN and TRUSTED_EXCHANGE_IP/TRUSTED_EXCHANGE_IPS are required")
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
@@ -568,6 +652,30 @@ def build_dashboard(days):
             "items": records}
 
 
+def empty_dashboard(days):
+    local_now = datetime.now().astimezone()
+    daily = [{"date": (local_now - timedelta(days=offset)).date().isoformat(),
+              "inbound": 0, "outbound": 0, "rejected": 0, "spoofed": 0}
+             for offset in range(days - 1, -1, -1)]
+    hourly = []
+    if days == 1:
+        hour_now = local_now.replace(minute=0, second=0, microsecond=0)
+        hourly = [{"time": (hour_now - timedelta(hours=offset)).isoformat(),
+                   "label": (hour_now - timedelta(hours=offset)).strftime("%H:00"),
+                   "inbound": 0, "outbound": 0, "rejected": 0, "spoofed": 0}
+                  for offset in range(23, -1, -1)]
+    return {"generatedAt": datetime.now(timezone.utc).isoformat(), "days": days,
+            "config": {"domain": COMPANY_DOMAIN, "trustedIps": sorted(TRUSTED_EXCHANGE_IPS),
+                       "nodes": [node["name"] for node in EDGE_NODES]},
+            "files": {"tracking": 0, "agent": 0, "protocol": 0}, "trustedMessages": 0,
+            "counts": {"inbound": 0, "outbound": 0, "rejected": 0, "failed": 0,
+                       "systemNdr": 0, "anomaly": 0, "spoofed": 0},
+            "daily": daily, "hourly": hourly,
+            "sync": {"mode": "sftp" if any(node["host"] for node in EDGE_NODES) else "mount",
+                     "lastSuccess": "", "newestRecord": "", "intervalSeconds": SFTP_SYNC_SECONDS,
+                     "nodes": []}, "items": []}
+
+
 def dashboard(days):
     now = time.time()
     with _cache_lock:
@@ -580,7 +688,12 @@ def dashboard(days):
             cached = _cache.get(days)
             if cached and now - cached[0] < CACHE_SECONDS:
                 return cached[1]
-        result = build_dashboard(days)
+        with _db_lock:
+            with database() as connection:
+                row = connection.execute("SELECT payload FROM dashboard_snapshots WHERE days=?", (days,)).fetchone()
+        result = json.loads(row[0]) if row else empty_dashboard(days)
+        result["generatedAt"] = datetime.now(timezone.utc).isoformat()
+        result["index"] = dict(_index_state)
         with _cache_lock:
             _cache[days] = (time.time(), result)
         return result
@@ -618,6 +731,19 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json(dashboard(days))
             except ValueError:
                 return self.send_json({"error": "days must be 1, 7 or 30"}, 400)
+            except Exception as exc:
+                return self.send_json({"error": str(exc)}, 500)
+        if parsed.path == "/api/logs":
+            try:
+                query = parse_qs(parsed.query)
+                days = int(query.get("days", ["1"])[0])
+                page = int(query.get("page", ["1"])[0])
+                page_size = int(query.get("pageSize", ["500"])[0])
+                if days not in (1, 7, 30):
+                    raise ValueError
+                return self.send_json(raw_log_page(days, page, page_size))
+            except ValueError:
+                return self.send_json({"error": "invalid days, page or pageSize"}, 400)
             except Exception as exc:
                 return self.send_json({"error": str(exc)}, 500)
         if parsed.path == "/":

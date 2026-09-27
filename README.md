@@ -10,6 +10,7 @@ Exchange Server 2019 Edge Transport 日志的只读 Web 仪表盘，支持最近
 - 显示 SFTP 最近成功同步时间和日志中的最新记录时间。
 - 点击记录查看完整详情，并可将当前筛选结果导出为 CSV。
 - 使用 SQLite 持久化日志索引，历史文件未改变时不再重复解析。
+- “全部日志”分页展示所有已采集原始数据行；无法分类或解析异常的行也会保留。
 
 ## 前提条件
 
@@ -78,14 +79,11 @@ services:
     secrets:
       - edge_password
     volumes:
-      - dashboard_data:/data
+      - ./data:/data
 
 secrets:
   edge_password:
     file: ./secrets/edge_password.txt
-
-volumes:
-  dashboard_data:
 ```
 
 `.env`：
@@ -115,6 +113,8 @@ CACHE_SECONDS=10
 ## 3. 启动
 
 ```bash
+mkdir -p data
+chmod 777 data
 docker compose pull
 docker compose up -d
 docker compose ps
@@ -209,12 +209,15 @@ docker run -d \
 
 ## 历史日志索引
 
-容器启动后会在后台静默同步所有节点当前保留的日志，并把解析结果保存到 `/data/dashboard.db`。网页的 1/7/30 天查询只读取数据库。Compose 使用 `dashboard_data` 命名卷持久化该数据库：
+容器启动后会在后台静默同步所有节点当前保留的日志，把原始索引和已经分类、关联、去重、统计好的 1/7/30 天快照保存到 `/data/dashboard.db`。网页直接读取成品快照，不会在点击 30 天时重新分析原始行。Compose 使用 `./data:/data` 保存数据库：
 
 - 文件未改变时直接查询 SQLite，不重新解析原始日志。
 - 当天仍在增长的日志文件发生变化时，只重新索引这些文件。
 - 历史日志不变时持续复用数据库索引。
-- 容器更新或重建后数据库卷继续保留。
+- 后台更新完成后一次性替换页面快照，查询期间不会读到半成品。
+- 容器更新或重建后 `./data/dashboard.db` 继续保留。
+- “全部日志”直接分页查询原始索引；分类标签显示后台整理后的邮件事件。
+- 字段数量不一致、时间无法识别或缺少字段定义的数据行仍会以“解析异常”保存，可在详情中查看原文。
 
 首次启动时数据会随着后台索引逐步出现。`SFTP_HISTORY_DAYS=0` 会同步 Edge 当前仍保留的全部日志；如果历史日志很多，也可以设置具体天数限制首次同步范围。
 

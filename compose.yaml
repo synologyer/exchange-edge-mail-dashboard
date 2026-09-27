@@ -28,11 +28,8 @@ services:
       - edge_password
     volumes:
       - ./secrets:/run/edge-secrets:ro
-      - dashboard_data:/data
+      - ./data:/data
 
 secrets:
   edge_password:
     file: ./secrets/edge_password.txt
-
-volumes:
-  dashboard_data:

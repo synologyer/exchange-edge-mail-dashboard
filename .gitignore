@@ -3,6 +3,7 @@ __pycache__/
 .DS_Store
 .env
 secrets/
+data/
 *.log
 *.LOG
 !tests/**/*.log
