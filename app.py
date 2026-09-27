@@ -18,17 +18,10 @@ try:
 except ImportError:
     paramiko = None
 
-SFTP_HOST = os.getenv("EDGE_HOST", "").strip()
-SFTP_PORT = int(os.getenv("EDGE_PORT", "22"))
-SFTP_USER = os.getenv("EDGE_USERNAME", "").strip()
-SFTP_PASSWORD = os.getenv("EDGE_PASSWORD", "")
-SFTP_PASSWORD_FILE = os.getenv("EDGE_PASSWORD_FILE", "").strip()
-SFTP_ROOT = os.getenv("EDGE_LOG_PATH", "/C:/Program Files/Microsoft/Exchange Server/V15/TransportRoles/Logs").rstrip("/")
-SFTP_FINGERPRINT = os.getenv("EDGE_HOST_KEY_SHA256", "").strip().removeprefix("SHA256:")
 SFTP_SYNC_SECONDS = int(os.getenv("SFTP_SYNC_SECONDS", "60"))
-LOG_ROOT = Path("/tmp/edge-logs" if SFTP_HOST else os.getenv("LOG_ROOT", "/logs"))
 COMPANY_DOMAIN = os.getenv("COMPANY_DOMAIN", "").strip().lower().lstrip("@")
 TRUSTED_EXCHANGE_IP = os.getenv("TRUSTED_EXCHANGE_IP", "").strip()
+TRUSTED_EXCHANGE_IPS = {ip.strip() for ip in os.getenv("TRUSTED_EXCHANGE_IPS", TRUSTED_EXCHANGE_IP).split(",") if ip.strip()}
 PORT = int(os.getenv("PORT", "8080"))
 CACHE_SECONDS = int(os.getenv("CACHE_SECONDS", "60"))
 STATIC_ROOT = Path(__file__).parent / "static"
@@ -36,42 +29,74 @@ MAX_ROWS = int(os.getenv("MAX_ROWS", "10000"))
 
 _cache = {}
 _cache_lock = threading.Lock()
-_sftp_lock = threading.Lock()
-_last_sftp_sync = 0.0
-_last_sftp_error = ""
+_sftp_locks = defaultdict(threading.Lock)
+_sync_state = defaultdict(lambda: {"lastSuccess": 0.0, "lastError": ""})
 
 
-def secret_password():
-    if SFTP_PASSWORD_FILE:
-        return Path(SFTP_PASSWORD_FILE).read_text(encoding="utf-8").strip()
-    return SFTP_PASSWORD
+def edge_nodes():
+    names = [name.strip() for name in os.getenv("EDGE_NODES", "").split(",") if name.strip()]
+    nodes = []
+    if names:
+        for name in names:
+            prefix = re.sub(r"[^A-Za-z0-9]", "_", name).upper()
+            host = os.getenv(f"{prefix}_HOST", "").strip()
+            nodes.append({
+                "name": name, "host": host, "port": int(os.getenv(f"{prefix}_PORT", "22")),
+                "user": os.getenv(f"{prefix}_USERNAME", "").strip(),
+                "password": os.getenv(f"{prefix}_PASSWORD", ""),
+                "passwordFile": os.getenv(f"{prefix}_PASSWORD_FILE", "").strip(),
+                "root": os.getenv(f"{prefix}_LOG_PATH", "/C:/Program Files/Microsoft/Exchange Server/V15/TransportRoles/Logs").rstrip("/"),
+                "fingerprint": os.getenv(f"{prefix}_HOST_KEY_SHA256", "").strip().removeprefix("SHA256:"),
+                "localRoot": Path("/tmp/edge-logs") / name,
+            })
+    else:
+        host = os.getenv("EDGE_HOST", "").strip()
+        nodes.append({
+            "name": os.getenv("EDGE_NAME", "mx").strip() or "mx", "host": host,
+            "port": int(os.getenv("EDGE_PORT", "22")), "user": os.getenv("EDGE_USERNAME", "").strip(),
+            "password": os.getenv("EDGE_PASSWORD", ""), "passwordFile": os.getenv("EDGE_PASSWORD_FILE", "").strip(),
+            "root": os.getenv("EDGE_LOG_PATH", "/C:/Program Files/Microsoft/Exchange Server/V15/TransportRoles/Logs").rstrip("/"),
+            "fingerprint": os.getenv("EDGE_HOST_KEY_SHA256", "").strip().removeprefix("SHA256:"),
+            "localRoot": Path("/tmp/edge-logs" if host else os.getenv("LOG_ROOT", "/logs")),
+        })
+    return nodes
 
 
-def verify_host_key(key):
-    if not SFTP_FINGERPRINT:
+EDGE_NODES = edge_nodes()
+LOG_ROOTS = [node["localRoot"] for node in EDGE_NODES]
+
+
+def secret_password(node):
+    if node["passwordFile"]:
+        return Path(node["passwordFile"]).read_text(encoding="utf-8").strip()
+    return node["password"]
+
+
+def verify_host_key(key, expected):
+    if not expected:
         return
     actual = base64.b64encode(hashlib.sha256(key.asbytes()).digest()).decode().rstrip("=")
-    if actual != SFTP_FINGERPRINT.rstrip("="):
-        raise RuntimeError(f"Edge SSH host key mismatch: expected SHA256:{SFTP_FINGERPRINT}, got SHA256:{actual}")
+    if actual != expected.rstrip("="):
+        raise RuntimeError(f"Edge SSH host key mismatch: expected SHA256:{expected}, got SHA256:{actual}")
 
 
-def sync_sftp_logs(force=False):
-    global _last_sftp_sync, _last_sftp_error
-    if not SFTP_HOST:
+def sync_sftp_node(node, force=False):
+    if not node["host"]:
         return
     if paramiko is None:
         raise RuntimeError("SFTP support is unavailable in this image")
-    with _sftp_lock:
+    state = _sync_state[node["name"]]
+    with _sftp_locks[node["name"]]:
         now = time.time()
-        if not force and now - _last_sftp_sync < SFTP_SYNC_SECONDS:
+        if not force and now - state["lastSuccess"] < SFTP_SYNC_SECONDS:
             return
-        if not SFTP_USER or not secret_password():
-            raise RuntimeError("EDGE_USERNAME and EDGE_PASSWORD/EDGE_PASSWORD_FILE are required")
-        transport = paramiko.Transport((SFTP_HOST, SFTP_PORT))
+        if not node["user"] or not secret_password(node):
+            raise RuntimeError(f"{node['name']}: username and password/password file are required")
+        transport = paramiko.Transport((node["host"], node["port"]))
         try:
             transport.start_client(timeout=15)
-            verify_host_key(transport.get_remote_server_key())
-            transport.auth_password(SFTP_USER, secret_password())
+            verify_host_key(transport.get_remote_server_key(), node["fingerprint"])
+            transport.auth_password(node["user"], secret_password(node))
             sftp = paramiko.SFTPClient.from_transport(transport)
             cutoff = now - (32 * 86400)
 
@@ -81,7 +106,7 @@ def sync_sftp_logs(force=False):
                 except OSError as exc:
                     if is_root:
                         raise RuntimeError(
-                            f"Cannot read EDGE_LOG_PATH '{SFTP_ROOT}': {exc}. "
+                            f"{node['name']}: cannot read log path '{node['root']}': {exc}. "
                             "Check the Windows OpenSSH path and NTFS read permission."
                         ) from exc
                     return
@@ -94,8 +119,8 @@ def sync_sftp_logs(force=False):
                         normalized = remote.lower().replace("\\", "/")
                         if not any(h in normalized for h in ("messagetracking", "agentlog", "protocollog/smtpreceive")):
                             continue
-                        relative = remote[len(SFTP_ROOT):].lstrip("/")
-                        local = LOG_ROOT / Path(relative)
+                        relative = remote[len(node["root"]):].lstrip("/")
+                        local = node["localRoot"] / Path(relative)
                         local.parent.mkdir(parents=True, exist_ok=True)
                         if local.exists() and local.stat().st_size == entry.st_size and int(local.stat().st_mtime) == entry.st_mtime:
                             continue
@@ -104,14 +129,24 @@ def sync_sftp_logs(force=False):
                         os.utime(temp, (entry.st_atime, entry.st_mtime))
                         temp.replace(local)
 
-            list(walk(SFTP_ROOT, is_root=True))
-            _last_sftp_sync = now
-            _last_sftp_error = ""
+            list(walk(node["root"], is_root=True))
+            state.update(lastSuccess=now, lastError="")
         except Exception as exc:
-            _last_sftp_error = str(exc)
+            state["lastError"] = str(exc)
             raise
         finally:
             transport.close()
+
+
+def sync_sftp_logs(force=False):
+    errors = []
+    for node in EDGE_NODES:
+        try:
+            sync_sftp_node(node, force)
+        except Exception as exc:
+            errors.append(str(exc))
+    if errors and len(errors) == len([node for node in EDGE_NODES if node["host"]]):
+        raise RuntimeError("; ".join(errors))
 
 
 def parse_time(value):
@@ -154,21 +189,33 @@ def message_key(row, stamp, prefix):
 
 
 def log_files(hint, cutoff):
-    if not LOG_ROOT.is_dir():
-        return []
     result = []
     normalized = hint.lower().replace("\\", "/")
-    for path in LOG_ROOT.rglob("*"):
-        if not path.is_file() or path.suffix.lower() != ".log":
+    for root in LOG_ROOTS:
+        if not root.is_dir():
             continue
-        if normalized not in str(path.parent).lower().replace("\\", "/"):
-            continue
-        try:
-            if datetime.fromtimestamp(path.stat().st_mtime, timezone.utc) >= cutoff - timedelta(days=1):
-                result.append(path)
-        except OSError:
-            pass
+        for path in root.rglob("*"):
+            if not path.is_file() or path.suffix.lower() != ".log":
+                continue
+            if normalized not in str(path.parent).lower().replace("\\", "/"):
+                continue
+            try:
+                if datetime.fromtimestamp(path.stat().st_mtime, timezone.utc) >= cutoff - timedelta(days=1):
+                    result.append(path)
+            except OSError:
+                pass
     return sorted(set(result))
+
+
+def node_for_path(path):
+    resolved = path.resolve()
+    for node in EDGE_NODES:
+        try:
+            resolved.relative_to(node["localRoot"].resolve())
+            return node["name"]
+        except ValueError:
+            continue
+    return EDGE_NODES[0]["name"] if EDGE_NODES else "mx"
 
 
 def read_rows(files, cutoff):
@@ -220,18 +267,18 @@ def rejection_category(status, reason=""):
     return "其他拒收"
 
 
-def item(stamp, kind, sender="", recipients="", remote_ip="", subject="", status="", reason="", source="", category="", connector=""):
+def item(stamp, kind, sender="", recipients="", remote_ip="", subject="", status="", reason="", source="", category="", connector="", node=""):
     return {
         "time": stamp.isoformat(), "type": kind, "sender": text(sender),
         "recipients": text(recipients), "remoteIp": text(remote_ip),
         "subject": text(subject), "status": text(status), "reason": text(reason), "source": source,
-        "category": text(category), "connector": text(connector),
+        "category": text(category), "connector": text(connector), "node": text(node),
     }
 
 
 def build_dashboard(days):
-    if not COMPANY_DOMAIN or not TRUSTED_EXCHANGE_IP:
-        raise RuntimeError("COMPANY_DOMAIN and TRUSTED_EXCHANGE_IP are required")
+    if not COMPANY_DOMAIN or not TRUSTED_EXCHANGE_IPS:
+        raise RuntimeError("COMPANY_DOMAIN and TRUSTED_EXCHANGE_IP/TRUSTED_EXCHANGE_IPS are required")
     sync_sftp_logs()
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     tracking = log_files("MessageTracking", cutoff)
@@ -239,17 +286,17 @@ def build_dashboard(days):
     for row, stamp, _ in read_rows(tracking, cutoff):
         if (row.get("event-id", "").upper() == "RECEIVE"
                 and row.get("directionality", "").lower() == "originating"
-                and text(row.get("client-ip")).strip("[]") == TRUSTED_EXCHANGE_IP):
+                and endpoint_ip(row.get("client-ip")) in TRUSTED_EXCHANGE_IPS):
             key = correlation_key(row)
             if key:
                 trusted.add(key)
 
-    records, seen = [], defaultdict(set)
+    records, seen = [], defaultdict(dict)
     domain_re = re.compile(r"@(?:[^@]+\.)?" + re.escape(COMPANY_DOMAIN) + r"$", re.I)
     is_company_sender = lambda sender: bool(domain_re.search(text(sender).lower()))
     send_event = lambda event, connector: event == "SEND" or (event == "SENDEXTERNAL" and re.search(r"\bto\s+internet\b", connector, re.I))
 
-    for row, stamp, _ in read_rows(tracking, cutoff):
+    for row, stamp, source_path in read_rows(tracking, cutoff):
         event = row.get("event-id", "").upper()
         direction = row.get("directionality", "").lower()
         sender = text(row.get("sender-address")).lower()
@@ -259,7 +306,7 @@ def build_dashboard(days):
         kind = None
         if event == "RECEIVE" and direction == "incoming":
             remote_ip = endpoint_ip(row.get("client-ip"))
-            kind = "匿名冒充公司域" if is_company_sender(sender) and remote_ip != TRUSTED_EXCHANGE_IP else "收件"
+            kind = "匿名冒充公司域" if is_company_sender(sender) and remote_ip not in TRUSTED_EXCHANGE_IPS else "收件"
         elif direction == "originating" and trusted_out and send_event(event, connector):
             if system_sender:
                 kind = "系统退信"
@@ -276,21 +323,38 @@ def build_dashboard(days):
                 kind = "异常发件人失败"
         if not kind:
             continue
+        categories = {
+            "收件": "正常外部来信",
+            "发件": "可信 Mail 正常外发",
+            "外发失败": "公司邮件外发失败",
+            "系统退信": "系统自动退信",
+            "系统退信失败": "系统退信发送失败",
+            "异常发件人": "可信 Mail 提交了非公司域发件地址",
+            "异常发件人失败": "异常发件地址外发失败",
+            "匿名冒充公司域": "外部连接冒充公司域发件人",
+        }
         key = message_key(row, stamp, kind)
+        node_name = node_for_path(Path(source_path))
         if key in seen[kind]:
+            existing = seen[kind][key]
+            nodes = [part.strip() for part in existing["node"].split(",") if part.strip()]
+            if node_name not in nodes:
+                existing["node"] = ", ".join(nodes + [node_name])
             continue
-        seen[kind].add(key)
-        records.append(item(
+        record = item(
             stamp, kind, row.get("sender-address"), row.get("recipient-address"),
             row.get("client-ip") if direction == "incoming" else row.get("server-ip"),
             row.get("message-subject"), event, row.get("recipient-status"), "MessageTracking",
-            "外部连接声称使用公司域发件人" if kind == "匿名冒充公司域" else "", connector
-        ))
+            categories.get(kind, ""), connector, node_name
+        )
+        seen[kind][key] = record
+        records.append(record)
 
     agent_files = log_files("AgentLog", cutoff)
     agent_responses = set()
     reject_seen = set()
-    for row, stamp, _ in read_rows(agent_files, cutoff):
+    for row, stamp, source_path in read_rows(agent_files, cutoff):
+        node_name = node_for_path(Path(source_path))
         action = text(row.get("Action"))
         response = text(row.get("SmtpResponse") or row.get("smtp-response"))
         if not (re.search(r"Reject|Delete|Quarantine", action, re.I) or re.match(r"^[45]\d\d", response)):
@@ -298,7 +362,7 @@ def build_dashboard(days):
         session = text(row.get("SessionId") or row.get("session-id"))
         normalized = re.sub(r"\s+", " ", response).lower()
         if session and normalized:
-            agent_responses.add((session, normalized))
+            agent_responses.add((node_name, session, normalized))
         recipient = row.get("Recipient") or row.get("Recipients")
         key = ("agent", session, stamp.replace(microsecond=0).isoformat(), response, text(recipient))
         if key in reject_seen:
@@ -307,19 +371,21 @@ def build_dashboard(days):
         reason = " ".join(filter(None, (text(row.get("Reason")), text(row.get("ReasonData")))))
         sender = row.get("P1FromAddress") or row.get("P2FromAddresses")
         remote = row.get("RemoteEndpoint") or row.get("remote-endpoint")
-        kind = "匿名冒充公司域（已拒收）" if is_company_sender(sender) and endpoint_ip(remote) != TRUSTED_EXCHANGE_IP else "拒收"
-        category = "外部连接声称使用公司域发件人" if kind.startswith("匿名冒充") else rejection_category(response or action, reason)
+        kind = "匿名冒充公司域（已拒收）" if is_company_sender(sender) and endpoint_ip(remote) not in TRUSTED_EXCHANGE_IPS else "拒收"
+        category = "外部连接冒充公司域发件人" if kind.startswith("匿名冒充") else rejection_category(response or action, reason)
         records.append(item(stamp, kind, sender, recipient, remote,
                             "", response or action, reason, "AgentLog", category,
-                            row.get("Agent")))
+                            row.get("Agent"), node_name))
 
     protocol_files = log_files("ProtocolLog/SmtpReceive", cutoff)
     sessions = {}
-    for row, stamp, _ in read_rows(protocol_files, cutoff):
+    for row, stamp, source_path in read_rows(protocol_files, cutoff):
+        node_name = node_for_path(Path(source_path))
         event, data = text(row.get("event")), text(row.get("data"))
         session = text(row.get("session-id"))
+        session_key = (node_name, session)
         if session and event == "<":
-            state = sessions.setdefault(session, {"sender": "", "recipient": ""})
+            state = sessions.setdefault(session_key, {"sender": "", "recipient": ""})
             match = re.match(r"^\s*MAIL\s+FROM\s*:\s*<([^>]*)>", data, re.I)
             if match:
                 state.update(sender=match.group(1), recipient="")
@@ -330,20 +396,20 @@ def build_dashboard(days):
         if event != ">" or not re.match(r"^[45]\d\d(?:[ -]|$)", data):
             continue
         normalized = re.sub(r"\s+", " ", data).lower()
-        if (session, normalized) in agent_responses:
+        if (node_name, session, normalized) in agent_responses:
             continue
         key = ("smtp", session, stamp.replace(microsecond=0).isoformat(), data)
         if key in reject_seen:
             continue
         reject_seen.add(key)
-        state = sessions.get(session, {})
+        state = sessions.get(session_key, {})
         sender = state.get("sender")
         remote = row.get("remote-endpoint")
-        kind = "匿名冒充公司域（已拒收）" if is_company_sender(sender) and endpoint_ip(remote) != TRUSTED_EXCHANGE_IP else "拒收"
-        category = "外部连接声称使用公司域发件人" if kind.startswith("匿名冒充") else rejection_category(data, row.get("context"))
+        kind = "匿名冒充公司域（已拒收）" if is_company_sender(sender) and endpoint_ip(remote) not in TRUSTED_EXCHANGE_IPS else "拒收"
+        category = "外部连接冒充公司域发件人" if kind.startswith("匿名冒充") else rejection_category(data, row.get("context"))
         records.append(item(stamp, kind, sender, state.get("recipient"),
                             remote, "", data, row.get("context"), "SmtpReceive", category,
-                            row.get("connector-id")))
+                            row.get("connector-id"), node_name))
 
     records.sort(key=lambda row: row["time"], reverse=True)
     if len(records) > MAX_ROWS:
@@ -379,14 +445,24 @@ def build_dashboard(days):
                            "rejected": sum(r["type"] == "拒收" for r in subset),
                            "spoofed": sum(r["type"].startswith("匿名冒充公司域") for r in subset)})
     newest_record = records[0]["time"] if records else ""
+    node_status = []
+    for node in EDGE_NODES:
+        state = _sync_state[node["name"]]
+        node_status.append({"name": node["name"], "host": node["host"],
+                            "mode": "sftp" if node["host"] else "mount",
+                            "online": (bool(state["lastSuccess"]) if node["host"] else node["localRoot"].is_dir()) and not state["lastError"],
+                            "lastSuccess": datetime.fromtimestamp(state["lastSuccess"], timezone.utc).isoformat() if state["lastSuccess"] else "",
+                            "lastError": state["lastError"]})
+    last_success = max((state["lastSuccess"] for state in _sync_state.values()), default=0)
     return {"generatedAt": datetime.now(timezone.utc).isoformat(), "days": days,
-            "config": {"domain": COMPANY_DOMAIN, "trustedIp": TRUSTED_EXCHANGE_IP, "logRoot": str(LOG_ROOT)},
+            "config": {"domain": COMPANY_DOMAIN, "trustedIps": sorted(TRUSTED_EXCHANGE_IPS),
+                       "nodes": [node["name"] for node in EDGE_NODES]},
             "files": {"tracking": len(tracking), "agent": len(agent_files), "protocol": len(protocol_files)},
             "trustedMessages": len(trusted), "counts": counts, "daily": daily, "hourly": hourly,
-            "sync": {"mode": "sftp" if SFTP_HOST else "mount",
-                     "lastSuccess": datetime.fromtimestamp(_last_sftp_sync, timezone.utc).isoformat() if _last_sftp_sync else "",
-                     "lastError": _last_sftp_error, "newestRecord": newest_record,
-                     "intervalSeconds": SFTP_SYNC_SECONDS if SFTP_HOST else 0},
+            "sync": {"mode": "sftp" if any(node["host"] for node in EDGE_NODES) else "mount",
+                     "lastSuccess": datetime.fromtimestamp(last_success, timezone.utc).isoformat() if last_success else "",
+                     "newestRecord": newest_record, "intervalSeconds": SFTP_SYNC_SECONDS,
+                     "nodes": node_status},
             "items": records}
 
 
@@ -418,8 +494,12 @@ class Handler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/health":
             try:
                 sync_sftp_logs()
-                ok = LOG_ROOT.is_dir()
-                return self.send_json({"status": "ok" if ok else "error", "logRootExists": ok, "mode": "sftp" if SFTP_HOST else "mount"})
+                states = [{"name": node["name"], "logRootExists": node["localRoot"].is_dir(),
+                           "online": (bool(_sync_state[node["name"]]["lastSuccess"]) if node["host"] else node["localRoot"].is_dir()) and not _sync_state[node["name"]]["lastError"],
+                           "error": _sync_state[node["name"]]["lastError"]} for node in EDGE_NODES]
+                ok = any(state["online"] for state in states)
+                return self.send_json({"status": "ok" if ok else "error", "nodes": states,
+                                       "mode": "sftp" if any(node["host"] for node in EDGE_NODES) else "mount"}, 200 if ok else 503)
             except Exception as exc:
                 return self.send_json({"status": "error", "error": str(exc), "mode": "sftp"}, 503)
         if parsed.path == "/api/dashboard":
@@ -450,5 +530,5 @@ class Handler(SimpleHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print(f"Exchange Edge dashboard listening on 0.0.0.0:{PORT}; logs={LOG_ROOT}", flush=True)
+    print(f"Exchange Edge dashboard listening on 0.0.0.0:{PORT}; nodes={','.join(node['name'] for node in EDGE_NODES)}", flush=True)
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()

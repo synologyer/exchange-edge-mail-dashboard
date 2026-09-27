@@ -119,6 +119,39 @@ docker compose pull
 docker compose up -d
 ```
 
+## 多 MX / Edge 集群模式
+
+同一个面板可以同时通过 SFTP 读取多台 MX。每台 MX 使用独立账号、密码文件、SSH 指纹和日志路径；页面可按节点筛选，并按邮件标识对跨节点记录去重。
+
+在 `.env` 中配置：
+
+```dotenv
+COMPANY_DOMAIN=company.example
+TRUSTED_EXCHANGE_IPS=192.0.2.10,192.0.2.12
+EDGE_NODES=mx1,mx2
+
+MX1_HOST=192.0.2.11
+MX1_PORT=22
+MX1_USERNAME=edge_log_reader
+MX1_PASSWORD_FILE=/run/edge-secrets/mx1_password.txt
+MX1_HOST_KEY_SHA256=
+
+MX2_HOST=192.0.2.21
+MX2_PORT=22
+MX2_USERNAME=edge_log_reader
+MX2_PASSWORD_FILE=/run/edge-secrets/mx2_password.txt
+MX2_HOST_KEY_SHA256=
+```
+
+密码分别保存为：
+
+```text
+secrets/mx1_password.txt
+secrets/mx2_password.txt
+```
+
+节点名称会转成大写环境变量前缀，例如 `mx-01` 对应 `MX_01_HOST`。现有单节点 `EDGE_HOST` 配置继续兼容。
+
 ## 本地日志挂载模式
 
 如果日志已经通过 SMB 或定时复制到 Docker 主机，可以不设置 `EDGE_HOST`，直接只读挂载：
@@ -141,6 +174,13 @@ docker run -d \
 |---|---|---|
 | `COMPANY_DOMAIN` | 必填 | 公司发件域名 |
 | `TRUSTED_EXCHANGE_IP` | 必填 | 向 Edge 提交外发邮件的 Mail 服务器 IP |
+| `TRUSTED_EXCHANGE_IPS` | 多节点时必填 | 可信 Mail 服务器 IP，多个用逗号分隔 |
+| `EDGE_NODES` | 空 | MX 节点名称，多个用逗号分隔；为空时使用原单节点配置 |
+| `<节点>_HOST` | 多节点时必填 | 对应 MX 的 SFTP 地址，例如 `MX1_HOST` |
+| `<节点>_PORT` | `22` | 对应 MX 的 OpenSSH 端口 |
+| `<节点>_USERNAME` | 多节点时必填 | 对应 MX 的日志只读账号 |
+| `<节点>_PASSWORD_FILE` | 建议设置 | 对应 MX 的密码文件 |
+| `<节点>_HOST_KEY_SHA256` | 空 | 对应 MX 的 SSH 主机密钥指纹 |
 | `EDGE_HOST` | 空 | Edge SFTP IP；设置后启用 SFTP 模式 |
 | `EDGE_PORT` | `22` | Edge OpenSSH 端口 |
 | `EDGE_USERNAME` | 空 | Windows 日志只读账号 |

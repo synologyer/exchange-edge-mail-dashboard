@@ -5,13 +5,16 @@ services:
     restart: unless-stopped
     ports:
       - "8080:8080"
+    env_file:
+      - .env
     environment:
       TZ: ${TZ:-Asia/Shanghai}
       COMPANY_DOMAIN: ${COMPANY_DOMAIN:?set COMPANY_DOMAIN in .env}
-      TRUSTED_EXCHANGE_IP: ${TRUSTED_EXCHANGE_IP:?set TRUSTED_EXCHANGE_IP in .env}
-      EDGE_HOST: ${EDGE_HOST:?set EDGE_HOST in .env}
+      TRUSTED_EXCHANGE_IP: ${TRUSTED_EXCHANGE_IP:-}
+      TRUSTED_EXCHANGE_IPS: ${TRUSTED_EXCHANGE_IPS:-}
+      EDGE_HOST: ${EDGE_HOST:-}
       EDGE_PORT: ${EDGE_PORT:-22}
-      EDGE_USERNAME: ${EDGE_USERNAME:?set EDGE_USERNAME in .env}
+      EDGE_USERNAME: ${EDGE_USERNAME:-}
       EDGE_PASSWORD_FILE: /run/secrets/edge_password
       EDGE_LOG_PATH: ${EDGE_LOG_PATH:-/C:/Program Files/Microsoft/Exchange Server/V15/TransportRoles/Logs}
       # 首次连接后建议填写服务器主机密钥指纹，格式为不带 SHA256: 前缀的 Base64 字符串。
@@ -20,6 +23,8 @@ services:
       CACHE_SECONDS: ${CACHE_SECONDS:-60}
     secrets:
       - edge_password
+    volumes:
+      - ./secrets:/run/edge-secrets:ro
 
 secrets:
   edge_password:
