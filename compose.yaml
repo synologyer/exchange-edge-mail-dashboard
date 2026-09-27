@@ -1,6 +1,6 @@
 services:
   exchange-edge-dashboard:
-    image: whc95800/exchange-edge-mail-dashboard:latest
+    image: synologyer/exchange-edge-mail-dashboard:latest
     container_name: exchange-edge-dashboard
     restart: unless-stopped
     ports:

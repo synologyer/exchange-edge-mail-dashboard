@@ -46,7 +46,7 @@ exchange-edge-dashboard/
 ```yaml
 services:
   exchange-edge-dashboard:
-    image: whc95800/exchange-edge-mail-dashboard:latest
+    image: synologyer/exchange-edge-mail-dashboard:latest
     container_name: exchange-edge-dashboard
     restart: unless-stopped
     ports:
@@ -124,7 +124,7 @@ docker run -d \
   -e COMPANY_DOMAIN=company.example \
   -e TRUSTED_EXCHANGE_IP=192.0.2.10 \
   -v /path/to/TransportRoles/Logs:/logs:ro \
-  whc95800/exchange-edge-mail-dashboard:latest
+  synologyer/exchange-edge-mail-dashboard:latest
 ```
 
 ## 主要环境变量
