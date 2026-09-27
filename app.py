@@ -29,6 +29,9 @@ MAX_ROWS = int(os.getenv("MAX_ROWS", "10000"))
 
 _cache = {}
 _cache_lock = threading.Lock()
+_build_lock = threading.Lock()
+_row_cache = {}
+_row_cache_lock = threading.Lock()
 _sftp_locks = defaultdict(threading.Lock)
 _sync_state = defaultdict(lambda: {"lastSuccess": 0.0, "lastError": ""})
 
@@ -220,23 +223,36 @@ def node_for_path(path):
 
 def read_rows(files, cutoff):
     for path in files:
-        headers = None
         try:
-            with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as handle:
-                for raw in handle:
-                    if raw.startswith("#Fields:"):
-                        headers = [part.strip() for part in raw[8:].strip().split(",")]
-                        continue
-                    if not headers or not raw.strip() or raw.startswith("#"):
-                        continue
-                    try:
-                        values = next(csv.reader([raw]))
-                        row = dict(zip(headers, values))
-                        stamp = parse_time(row.get("date-time") or row.get("Timestamp"))
-                        if stamp and stamp >= cutoff:
-                            yield row, stamp, str(path)
-                    except (csv.Error, ValueError):
-                        continue
+            stat = path.stat()
+            signature = (stat.st_mtime_ns, stat.st_size)
+            cache_key = str(path)
+            with _row_cache_lock:
+                cached = _row_cache.get(cache_key)
+            if cached and cached[0] == signature:
+                parsed = cached[1]
+            else:
+                parsed, headers = [], None
+                with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as handle:
+                    for raw in handle:
+                        if raw.startswith("#Fields:"):
+                            headers = [part.strip() for part in raw[8:].strip().split(",")]
+                            continue
+                        if not headers or not raw.strip() or raw.startswith("#"):
+                            continue
+                        try:
+                            values = next(csv.reader([raw]))
+                            row = dict(zip(headers, values))
+                            stamp = parse_time(row.get("date-time") or row.get("Timestamp"))
+                            if stamp:
+                                parsed.append((row, stamp))
+                        except (csv.Error, ValueError):
+                            continue
+                with _row_cache_lock:
+                    _row_cache[cache_key] = (signature, parsed)
+            for row, stamp in parsed:
+                if stamp >= cutoff:
+                    yield row, stamp, str(path)
         except (OSError, PermissionError):
             continue
 
@@ -472,10 +488,16 @@ def dashboard(days):
         cached = _cache.get(days)
         if cached and now - cached[0] < CACHE_SECONDS:
             return cached[1]
-    result = build_dashboard(days)
-    with _cache_lock:
-        _cache[days] = (now, result)
-    return result
+    with _build_lock:
+        now = time.time()
+        with _cache_lock:
+            cached = _cache.get(days)
+            if cached and now - cached[0] < CACHE_SECONDS:
+                return cached[1]
+        result = build_dashboard(days)
+        with _cache_lock:
+            _cache[days] = (time.time(), result)
+        return result
 
 
 class Handler(SimpleHTTPRequestHandler):
