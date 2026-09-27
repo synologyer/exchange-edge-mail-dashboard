@@ -31,7 +31,7 @@ STATIC_ROOT = Path(__file__).parent / "static"
 MAX_ROWS = int(os.getenv("MAX_ROWS", "10000"))
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "/data/dashboard.db"))
 PARSER_VERSION = "2"
-ANALYZER_VERSION = "3"
+ANALYZER_VERSION = "4"
 
 _cache = {}
 _cache_lock = threading.Lock()
@@ -409,9 +409,9 @@ def classify_raw_log(source, event, pick, parse_error):
     connector = text(pick("connector-id", "connector"))
     agent = text(pick("agent", "source-context"))
     action = text(pick("action"))
-    reason = text(pick("reason", "recipient-status", "smtp-response", "smtpresponse"))
+    reason = text(pick("reason", "recipient-status", "smtp-response", "smtpresponse", "data", "context"))
     response = " ".join((reason, text(pick("smtp-response", "smtpresponse")),
-                         text(pick("source-context", "sourcecontext")))).lower()
+                         text(pick("source-context", "sourcecontext", "context")))).lower()
     recipient_missing = is_missing_recipient(response)
     rejected = action.lower().startswith("reject") or re.match(r"^[45]\d\d", response.strip())
     if recipient_missing:
@@ -444,17 +444,17 @@ def raw_log_page(days, page=1, page_size=500):
         failed = connection.execute("SELECT count(*) FROM log_rows WHERE stamp=''", ()).fetchone()[0]
         total = dated + failed
         rows = connection.execute(
-            "SELECT payload,stamp,path FROM log_rows WHERE stamp>=? ORDER BY stamp DESC LIMIT ? OFFSET ?",
+            "SELECT rowid,payload,stamp,path FROM log_rows WHERE stamp>=? ORDER BY stamp DESC LIMIT ? OFFSET ?",
             (cutoff.isoformat(), page_size, offset),
         ).fetchall() if offset < dated else []
         if len(rows) < page_size and offset + len(rows) >= dated:
             failed_offset = max(0, offset - dated)
             rows.extend(connection.execute(
-                "SELECT payload,stamp,path FROM log_rows WHERE stamp='' ORDER BY path LIMIT ? OFFSET ?",
+                "SELECT rowid,payload,stamp,path FROM log_rows WHERE stamp='' ORDER BY path LIMIT ? OFFSET ?",
                 (page_size - len(rows), failed_offset),
             ).fetchall())
     items = []
-    for payload, stamp_text, source_path in rows:
+    for raw_id, payload, stamp_text, source_path in rows:
         try:
             row = json.loads(payload)
         except json.JSONDecodeError:
@@ -475,15 +475,68 @@ def raw_log_page(days, page=1, page_size=500):
             pick("recipient-address", "recipient", "recipients", "rcpt-to"),
             endpoint_ip(pick("client-ip", "remote-endpoint", "ip-address")),
             pick("message-subject", "subject"), event,
-            parse_error or pick("recipient-status", "smtp-response", "reason", "_raw"),
+            parse_error or pick("recipient-status", "smtp-response", "smtpresponse", "reason", "data", "context", "_raw"),
             source, category,
             pick("connector-id", "connector", "agent"), node_for_path(Path(source_path)),
         ))
         items[-1]["resultText"] = result_text
         items[-1]["resultClass"] = result_class
-        items[-1]["rawData"] = row
+        items[-1]["rawIds"] = [raw_id]
+    items = merge_rejection_records(items)
     return {"days": days, "page": page, "pageSize": page_size, "total": total,
             "parseErrors": failed, "items": items}
+
+
+def raw_log_details(raw_ids):
+    ids = sorted({int(value) for value in raw_ids if str(value).isdigit()})[:10]
+    if not ids:
+        raise ValueError("at least one valid log id is required")
+    placeholders = ",".join("?" for _ in ids)
+    with database() as connection:
+        rows = connection.execute(
+            f"SELECT rowid,payload,path FROM log_rows WHERE rowid IN ({placeholders})", ids
+        ).fetchall()
+    result = []
+    for raw_id, payload, path in rows:
+        try:
+            raw = json.loads(payload)
+        except json.JSONDecodeError:
+            raw = {"_raw": payload, "_parseError": "数据库记录不是有效 JSON"}
+        result.append({"id": raw_id, "source": path, "fields": raw})
+    return {"items": result}
+
+
+def smtp_response_key(record):
+    value = f"{record.get('status', '')} {record.get('reason', '')}".lower()
+    match = re.search(r"\b([45]\d\d(?:[ .-]\d+){0,2})\b", value)
+    return re.sub(r"\s+", " ", match.group(1).replace("-", ".")) if match else ""
+
+
+def merge_rejection_records(records):
+    """Merge AgentLog and SMTP protocol views of one rejection for display only."""
+    rejection_types = {"已有邮箱邮件被拒", "无效邮箱投递"}
+    merged, candidates = [], {}
+    for record in records:
+        if record.get("type") not in rejection_types or record.get("source") not in {"AgentLog", "SmtpReceive"}:
+            merged.append(record)
+            continue
+        stamp = text(record.get("time"))[:19]
+        key = (record.get("node"), stamp, smtp_response_key(record))
+        previous = candidates.get(key) if key[2] else None
+        if previous and previous.get("source") != record.get("source"):
+            for field in ("sender", "recipients", "remoteIp", "subject", "status", "reason", "connector"):
+                if not previous.get(field) and record.get(field):
+                    previous[field] = record[field]
+            previous["rawIds"] = sorted(set(previous.get("rawIds", []) + record.get("rawIds", [])))
+            if record.get("type") == "无效邮箱投递":
+                previous.update(type=record["type"], category=record["category"],
+                                resultText=record.get("resultText", "已成功拦截"),
+                                resultClass=record.get("resultClass", "ok"))
+            previous["source"] = "AgentLog + SmtpReceive"
+            continue
+        candidates[key] = record
+        merged.append(record)
+    return merged
 
 
 def event_page(days, page=1, page_size=200, event_filter=""):
@@ -699,6 +752,7 @@ def analyze_dashboard(days):
                             remote, "", data, row.get("context"), "SmtpReceive", category,
                             row.get("connector-id"), node_name))
 
+    records = merge_rejection_records(records)
     records.sort(key=lambda row: row["time"], reverse=True)
     if len(records) > MAX_ROWS:
         records = records[:MAX_ROWS]
@@ -853,6 +907,14 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json(raw_log_page(days, page, page_size))
             except ValueError:
                 return self.send_json({"error": "invalid days, page or pageSize"}, 400)
+            except Exception as exc:
+                return self.send_json({"error": str(exc)}, 500)
+        if parsed.path == "/api/log-detail":
+            try:
+                query = parse_qs(parsed.query)
+                return self.send_json(raw_log_details(query.get("id", [])))
+            except ValueError as exc:
+                return self.send_json({"error": str(exc)}, 400)
             except Exception as exc:
                 return self.send_json({"error": str(exc)}, 500)
         if parsed.path == "/api/events":
