@@ -155,6 +155,8 @@ Get-Content 'C:\Program Files\Microsoft\Exchange Server\V15\TransportRoles\Logs\
 
 如果 `status` 不是 `ok`，先查看同一文件的 `error`。更新镜像只更新面板；安装采集脚本和确认每台 Edge 上的定时任务，需要在相应 Windows 服务器上操作。采集脚本默认最多收集 200 条邮件概要，可用 `-MaxMessages` 调整，且快照有 8 MB 上限。
 
+升级采集脚本时，把仓库最新版的两个 `.ps1` 文件放在同一目录，重新运行上面的安装命令；安装程序会替换受保护的脚本并重启任务。仅更新 Docker 镜像不会替换 Edge 上的脚本。
+
 在 `.env` 中配置：
 
 ```dotenv

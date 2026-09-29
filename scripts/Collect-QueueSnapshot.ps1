@@ -9,13 +9,18 @@ param(
 $ErrorActionPreference = 'Stop'
 function Write-Snapshot($Snapshot) {
     $temp = "$OutputPath.$PID.tmp"
+    $backup = "$OutputPath.$PID.bak"
     try {
         $json = $Snapshot | ConvertTo-Json -Depth 8 -Compress
         $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($json)
         if ($bytes.Length -gt 8MB) { throw 'Queue snapshot exceeds 8 MB; reduce MaxMessages.' }
         [System.IO.File]::WriteAllBytes($temp, $bytes)
         if ([System.IO.File]::Exists($OutputPath)) {
-            [System.IO.File]::Replace($temp, $OutputPath, $null)
+            # Windows PowerShell 5.1 coerces $null to an empty string here.
+            [System.IO.File]::Replace($temp, $OutputPath, $backup)
+            if (Test-Path -LiteralPath $backup) {
+                Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+            }
         } else {
             [System.IO.File]::Move($temp, $OutputPath)
         }
