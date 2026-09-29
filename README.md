@@ -135,6 +135,26 @@ docker compose up -d
 
 同一个面板可以同时通过 SFTP 读取多台 MX。每台 MX 使用独立账号、密码文件、SSH 指纹和日志路径；页面可按节点筛选，并按邮件标识对跨节点记录去重。
 
+## 邮件队列快照（每台 Edge 单独安装）
+
+邮件队列页读取每台 Edge 在日志目录 `Dashboard/queue-snapshot.json` 生成的快照。首次部署后若尚未安装采集任务，页面会提示“尚未找到队列快照”；不会把采集失败解释为队列为空。队列页不执行远程命令，也不提供队列重试或删除。快照含发件人、收件人、主题和原始错误，请只允许指定日志读取账号读取。
+
+在**每台 Edge 服务器**上，把本仓库 `scripts` 目录的两个 `.ps1` 文件放进同一目录，以管理员身份打开 **Windows PowerShell 5.1** 后运行：
+
+```powershell
+cd C:\Temp\edge-dashboard-scripts
+.\Install-QueueCollector.ps1 -ReaderAccount 'edge_log_reader' -IntervalSeconds 30
+```
+
+如果日志目录不在 Exchange 默认位置，可加 `-LogRoot 'D:\ExchangeLogs'`；必须与该节点的 `<节点>_LOG_PATH` / `EDGE_LOG_PATH` 指向同一目录。安装脚本创建 SYSTEM 身份的任务 `ExchangeEdgeDashboard-QueueSnapshot`；读取账号仅能读取输出文件，不能修改安装后的脚本。安装完成后在 Edge 上检查：
+
+```powershell
+Get-ScheduledTaskInfo -TaskName 'ExchangeEdgeDashboard-QueueSnapshot' | Format-List LastRunTime,LastTaskResult
+Get-Content 'C:\Program Files\Microsoft\Exchange Server\V15\TransportRoles\Logs\Dashboard\queue-snapshot.json' -Raw | ConvertFrom-Json | Format-List status,collectedAt,error
+```
+
+如果 `status` 不是 `ok`，先查看同一文件的 `error`。更新镜像只更新面板；安装采集脚本和确认每台 Edge 上的定时任务，需要在相应 Windows 服务器上操作。采集脚本默认最多收集 200 条邮件概要，可用 `-MaxMessages` 调整，且快照有 8 MB 上限。
+
 在 `.env` 中配置：
 
 ```dotenv
@@ -204,6 +224,8 @@ docker run -d \
 | `SFTP_SYNC_SECONDS` | `60` | 从 Edge 重新检查日志的最小间隔秒数 |
 | `BACKGROUND_INDEX_SECONDS` | `30` | 后台检查并更新 SQLite 索引的间隔秒数 |
 | `SFTP_HISTORY_DAYS` | `0` | 首次同步历史天数；`0` 表示当前保留的全部日志 |
+| `QUEUE_SYNC_SECONDS` | `30` | Docker 从每台 Edge 检查队列快照的间隔秒数 |
+| `QUEUE_STALE_SECONDS` | `120` | 超过该秒数的快照显示为过期 |
 | `CACHE_SECONDS` | `60` | 后端缓存秒数 |
 | `MAX_ROWS` | `10000` | API 最大记录数 |
 | `DATABASE_PATH` | `/data/dashboard.db` | SQLite 持久化日志索引路径 |

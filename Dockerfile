@@ -3,6 +3,7 @@ LABEL org.opencontainers.image.title="Exchange Edge Mail Dashboard" \
       org.opencontainers.image.description="Read-only web dashboard for Exchange 2019 Edge Transport logs"
 WORKDIR /app
 COPY app.py /app/app.py
+COPY queue_snapshots.py /app/queue_snapshots.py
 COPY static /app/static
 RUN pip install --no-cache-dir "paramiko==3.5.1" && \
     addgroup -S dashboard && adduser -S -G dashboard dashboard && \

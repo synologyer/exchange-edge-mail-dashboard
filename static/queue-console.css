@@ -1,0 +1,5 @@
+.queue-toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:18px 0}
+.queue-reason{white-space:normal;min-width:190px;max-width:450px;overflow-wrap:anywhere}
+#queueMessages{margin-top:30px}
+#workspace .table-wrap{overflow-x:auto;margin-bottom:20px}
+#workspace .node-card .warn{overflow-wrap:anywhere}

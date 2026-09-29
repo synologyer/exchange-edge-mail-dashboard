@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+from queue_snapshots import QueueSnapshots
 
 try:
     import paramiko
@@ -875,6 +876,13 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
+        if parsed.path == "/api/queues":
+            query = parse_qs(parsed.query)
+            try:
+                page = max(1, int(query.get('page', ['1'])[0]))
+            except ValueError:
+                return self.send_json({'error': 'invalid page'}, 400)
+            return self.send_json(queue_snapshots.payload(query.get('node', [''])[0], query.get('queue', [''])[0], page))
         if parsed.path == "/api/health":
             try:
                 states = [{"name": node["name"], "logRootExists": node["localRoot"].is_dir(),
@@ -948,7 +956,11 @@ class Handler(SimpleHTTPRequestHandler):
         print(f"{self.address_string()} - {fmt % args}", flush=True)
 
 
+queue_snapshots = QueueSnapshots(EDGE_NODES, secret_password, verify_host_key, paramiko,
+    int(os.getenv('QUEUE_SYNC_SECONDS', '30')), int(os.getenv('QUEUE_STALE_SECONDS', '120')))
+
 if __name__ == "__main__":
     print(f"Exchange Edge dashboard listening on 0.0.0.0:{PORT}; nodes={','.join(node['name'] for node in EDGE_NODES)}", flush=True)
     threading.Thread(target=background_index_loop, name="log-indexer", daemon=True).start()
+    queue_snapshots.start()
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()

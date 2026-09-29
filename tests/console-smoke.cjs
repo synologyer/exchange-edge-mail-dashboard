@@ -14,6 +14,7 @@ const server = http.createServer((req,res)=>{
   const days=Number(url.searchParams.get('days')||1);
   if(url.pathname==='/api/dashboard')return res.end(JSON.stringify({days,generatedAt:stamp,config:{domain:'company.example',trustedIps:['192.0.2.10'],nodes:['mx1','mx2']},counts:{inbound:3286,outbound:209,rejected:87,failed:43,spoofed:32,systemNdr:2},daily:Array.from({length:days},(_,i)=>({date:`2026-09-${String(i+1).padStart(2,'0')}`,inbound:20+i%6*13,outbound:10,rejected:2,spoofed:1})),hourly:Array.from({length:24},(_,i)=>({label:`${i}:00`,inbound:10+i%7*10,outbound:5,rejected:2,spoofed:0})),sync:{mode:'sftp',lastSuccess:stamp,newestRecord:stamp,intervalSeconds:60,nodes:[{name:'mx1',online:true,lastSuccess:stamp},{name:'mx2',online:false,lastError:'连接超时'}]},index:{files:690,lastSuccess:stamp},files:{tracking:120,agent:30,protocol:10},trustedMessages:200}));
   if(url.pathname==='/api/log-detail')return res.end(JSON.stringify({items:[{fields:{'event-id':'RECEIVE'}}]}));
+  if(url.pathname==='/api/queues')return res.end(JSON.stringify({intervalSeconds:30,staleSeconds:120,nodes:[{name:'mx1',status:'ok',collectedAt:stamp,messageCount:2,queues:[{identity:'mx1\\42',status:'Retry',nextHopDomain:'example.org',messageCount:2,lastError:'554 5.7.1 Bad IP',messages:[{sender:'sender@example.org',recipients:['user@company.example'],subject:'测试队列',status:'Retry'}],capturedMessages:1,page:1,messagesTruncated:true}]},{name:'mx2',status:'unavailable',messageCount:null,queues:[],error:'尚未找到队列快照'}]}));
   return setTimeout(()=>res.end(JSON.stringify({items:[{...event,subject:`${days}天的记录`}],page:1,pageSize:100,total:1,parseErrors:0})),days===30?150:10);
  }
  const file=path.join(root,url.pathname==='/'?'index.html':url.pathname.slice(1));
@@ -29,7 +30,9 @@ const server = http.createServer((req,res)=>{
  await page.waitForTimeout(250);assert.equal(await page.locator('#rows tr').count(),1);assert.match(await page.locator('#rows').innerText(),/7天的记录/);
  await page.locator('#rows tr').click();await page.getByText('"event-id": "RECEIVE"',{exact:false}).waitFor();await page.locator('#closeDetail').click();
  await page.locator('[data-view="servers"]').click();await page.getByText('连接超时',{exact:true}).waitFor();
- await page.locator('[data-view="queue"]').click();await page.getByText('尚未连接实时队列',{exact:true}).waitFor();
+ await page.locator('[data-view="queue"]').click();await page.getByText('邮件队列快照',{exact:true}).waitFor();
+ await page.getByText('尚未找到队列快照',{exact:true}).waitFor();await page.getByText('554 5.7.1 Bad IP',{exact:true}).waitFor();
+ await page.getByRole('button',{name:'查看邮件'}).click();await page.getByText('测试队列',{exact:true}).waitFor();
  await page.setViewportSize({width:390,height:844});await page.locator('.mobile-menu').click();await page.locator('[data-view="overview"]').click();assert.equal(await page.locator('.sidebar').evaluate(e=>e.classList.contains('open')),false);
  await page.waitForTimeout(200);await page.screenshot({path:'/tmp/edge-console-mobile.png',fullPage:true});assert.deepEqual(errors,[]);console.log('Browser checks passed: navigation, date switch, lazy details, node errors, queue state, mobile.');
  }finally{await browser.close();server.close()}})().catch(e=>{console.error(e);server.close();process.exitCode=1});
