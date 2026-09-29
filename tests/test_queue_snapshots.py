@@ -27,10 +27,18 @@ class QueueSnapshotTest(unittest.TestCase):
             page = reader.payload(selected_queue='mx\\24')['nodes'][0]
             self.assertEqual(page['status'], 'ok')
             self.assertEqual(page['messageCount'], 2)
+            self.assertIsInstance(page['ageSeconds'], int)
             self.assertEqual(len(page['queues'][0]['messages']), 1)
             output.write_text(json.dumps(snapshot(datetime.now(timezone.utc)-timedelta(minutes=5))), encoding='utf-8')
             reader.collect(node)
-            self.assertEqual(reader.payload()['nodes'][0]['status'], 'stale')
+            stale = reader.payload()['nodes'][0]
+            self.assertEqual(stale['status'], 'stale')
+            self.assertGreater(stale['ageSeconds'], 60)
+            output.write_text(json.dumps(snapshot(datetime.now(timezone.utc)+timedelta(minutes=5))), encoding='utf-8')
+            reader.collect(node)
+            skewed = reader.payload()['nodes'][0]
+            self.assertEqual(skewed['status'], 'stale')
+            self.assertLess(skewed['ageSeconds'], -60)
             output.write_text('{broken', encoding='utf-8')
             reader.collect(node)
             self.assertEqual(reader.payload()['nodes'][0]['status'], 'error')

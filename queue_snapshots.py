@@ -102,10 +102,11 @@ class QueueSnapshots:
             state = states.get(node['name'], {})
             snapshot = state.get('snapshot')
             item = {'name': node['name'], 'status': 'unavailable', 'error': state.get('error', ''),
-                    'collectedAt': None, 'messageCount': None, 'queues': []}
+                    'collectedAt': None, 'ageSeconds': None, 'messageCount': None, 'queues': []}
             if snapshot:
                 age = time.time() - datetime.fromisoformat(snapshot['collectedAt'].replace('Z', '+00:00')).timestamp()
-                item.update(collectedAt=snapshot['collectedAt'], error=state.get('error') or snapshot.get('error', ''))
+                item.update(collectedAt=snapshot['collectedAt'], ageSeconds=round(age),
+                            error=state.get('error') or snapshot.get('error', ''))
                 item['status'] = ('error' if item['error'] or snapshot['status'] == 'error' else
                                   'stale' if age > self.stale or age < -60 else 'ok')
                 item['messageCount'] = sum(q['messageCount'] for q in snapshot['queues']) if snapshot['status'] == 'ok' else None

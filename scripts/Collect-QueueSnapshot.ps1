@@ -30,17 +30,19 @@ function Write-Snapshot($Snapshot) {
 }
 $clock = [Diagnostics.Stopwatch]::StartNew()
 do {
+    $failed = $false
     $snapshot = [ordered]@{
         schemaVersion = 1; collectedAt = [DateTime]::UtcNow.ToString('o')
         server = $env:COMPUTERNAME; status = 'ok'; error = ''; queues = @()
     }
     try {
-        if (-not (Get-Command Get-Queue -ErrorAction SilentlyContinue)) {
-            # Edge uses local Exchange snap-ins. Do not invoke the Mailbox
-            # server's exchange.ps1 bootstrap, which expects AD session cmdlets.
+        if (-not (Get-PSSnapin -Name Microsoft.Exchange.Management.PowerShell.SnapIn -ErrorAction SilentlyContinue)) {
+            # Edge uses its local management snap-in. Do not load exchange.ps1.
             Add-PSSnapin Microsoft.Exchange.Management.PowerShell.SnapIn -ErrorAction Stop
-            if (-not (Get-Command Get-Queue -ErrorAction SilentlyContinue)) {
-                throw 'Get-Queue unavailable after loading the local Exchange snap-in.'
+        }
+        foreach ($name in @('Get-Queue', 'Get-Message')) {
+            if (-not (Get-Command $name -ErrorAction SilentlyContinue)) {
+                throw "$name unavailable after loading the local Exchange snap-in."
             }
         }
         $remaining = $MaxMessages
@@ -73,11 +75,14 @@ do {
         })
         Write-Snapshot $snapshot
     } catch {
+        $failed = $true
         $snapshot.status = 'error'
         $snapshot.error = $_.Exception.Message
         $snapshot.queues = @()
         Write-Snapshot $snapshot
+        if ($Once) { exit 1 }
     }
     if ($Once -or ($clock.Elapsed.TotalSeconds + $IntervalSeconds) -ge 58) { break }
     Start-Sleep -Seconds $IntervalSeconds
 } while ($clock.Elapsed.TotalSeconds -lt 58)
+if ($failed) { exit 1 }

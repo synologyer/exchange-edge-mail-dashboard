@@ -139,23 +139,23 @@ docker compose up -d
 
 邮件队列页读取每台 Edge 在日志目录 `Dashboard/queue-snapshot.json` 生成的快照。首次部署后若尚未安装采集任务，页面会提示“尚未找到队列快照”；不会把采集失败解释为队列为空。队列页不执行远程命令，也不提供队列重试或删除。快照含发件人、收件人、主题和原始错误，请只允许指定日志读取账号读取。
 
-在**每台 Edge 服务器**上，把本仓库 `scripts` 目录的两个 `.ps1` 文件放进同一目录，以管理员身份打开 **Windows PowerShell 5.1** 后运行：
+在**每台 Edge 服务器**上，把本仓库 `scripts` 目录的 `Collect-QueueSnapshot.ps1` 和 `Install-QueueCollector.bat` 放进同一目录。以管理员身份打开 **命令提示符（cmd.exe）**，运行：
 
-```powershell
-cd C:\Temp\edge-dashboard-scripts
-.\Install-QueueCollector.ps1 -ReaderAccount 'edge_log_reader' -IntervalSeconds 30
+```bat
+cd /d C:\Temp\edge-dashboard-scripts
+Install-QueueCollector.bat edge_log_reader
 ```
 
-如果日志目录不在 Exchange 默认位置，可加 `-LogRoot 'D:\ExchangeLogs'`；必须与该节点的 `<节点>_LOG_PATH` / `EDGE_LOG_PATH` 指向同一目录。安装脚本创建 SYSTEM 身份的任务 `ExchangeEdgeDashboard-QueueSnapshot`；读取账号仅能读取输出文件，不能修改安装后的脚本。安装完成后在 Edge 上检查：
+如果日志目录不在 Exchange 默认位置，先在该 cmd 窗口执行 `set "EDGE_LOG_ROOT=D:\ExchangeLogs"`；必须与该节点的 `<节点>_LOG_PATH` / `EDGE_LOG_PATH` 指向同一目录。BAT 安装器会先手动采集一次，成功后才提示输入当前管理员账号密码，创建任务 `ExchangeEdgeDashboard-QueueSnapshot`。任务每分钟启动一次，在该分钟内采集最多两次；只读使用本地 `Get-Queue` / `Get-Message`，不加载 `exchange.ps1`，不改 Exchange 设置。读取账号仅获得快照目录的读取权限。安装完成后在 Edge 上检查：
 
 ```powershell
 Get-ScheduledTaskInfo -TaskName 'ExchangeEdgeDashboard-QueueSnapshot' | Format-List LastRunTime,LastTaskResult
 Get-Content 'C:\Program Files\Microsoft\Exchange Server\V15\TransportRoles\Logs\Dashboard\queue-snapshot.json' -Raw -Encoding UTF8 | ConvertFrom-Json | Format-List status,collectedAt,error
 ```
 
-如果 `status` 不是 `ok`，先查看同一文件的 `error`。更新镜像只更新面板；安装采集脚本和确认每台 Edge 上的定时任务，需要在相应 Windows 服务器上操作。采集脚本默认最多收集 200 条邮件概要，可用 `-MaxMessages` 调整，且快照有 8 MB 上限。
+如果 `status` 不是 `ok`，先查看同一文件的 `error`；任务进程的最后一次输出保存在 `%ProgramData%\ExchangeEdgeDashboardCollector\collector-last-run.log`。更新镜像只更新面板；安装采集脚本和确认每台 Edge 上的定时任务，需要在相应 Windows 服务器上操作。采集脚本默认最多收集 200 条邮件概要，且快照有 8 MB 上限。
 
-升级采集脚本时，把仓库最新版的两个 `.ps1` 文件放在同一目录，重新运行上面的安装命令；安装程序会替换受保护的脚本并重启任务。仅更新 Docker 镜像不会替换 Edge 上的脚本。
+升级采集脚本时，先核对并删除旧的 `ExchangeEdgeDashboard-QueueSnapshot` 任务，再把新版 `.ps1` 与 `.bat` 放在同一目录运行安装器；安装器发现同名任务时会停止，不会覆盖。仅更新 Docker 镜像不会替换 Edge 上的脚本。
 
 在 `.env` 中配置：
 

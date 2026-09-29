@@ -1,5 +1,24 @@
-.queue-toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:18px 0}
-.queue-reason{white-space:normal;min-width:190px;max-width:450px;overflow-wrap:anywhere}
-#queueMessages{margin-top:30px}
-#workspace .table-wrap{overflow-x:auto;margin-bottom:20px}
-#workspace .node-card .warn{overflow-wrap:anywhere}
+.queue-panel{min-width:0}
+.queue-nodes{display:grid;gap:8px;margin:18px 0}
+.queue-node{display:flex;align-items:center;gap:12px 24px;flex-wrap:wrap;padding:13px 16px;border:1px solid var(--line);border-radius:7px;background:#f9fbfd;font-size:13px}
+.queue-node strong{font-size:15px;min-width:70px}
+.queue-node-alert{background:#fff9f3;border-color:#f4d9bc}
+.queue-status{font-weight:650}
+.queue-node-error{color:var(--orange);overflow-wrap:anywhere}
+.queue-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:16px 0}
+.queue-count{color:var(--muted);font-size:12px;margin-left:auto}
+.queue-table-wrap{width:100%;overflow-x:auto;border:1px solid var(--line);border-radius:7px}
+.queue-table{width:100%;min-width:850px;border-collapse:collapse;table-layout:fixed;font-size:13px}
+.queue-table th,.queue-table td{text-align:left;vertical-align:middle;padding:10px 12px;border-bottom:1px solid var(--line);overflow-wrap:anywhere}
+.queue-table tr:last-child td{border-bottom:0}
+.queue-table th{background:#f7f9fc;color:#596a81;font-weight:600;white-space:nowrap}
+.queue-table tbody tr:hover{background:#f8fbff}
+.queue-table th:nth-child(1){width:9%}.queue-table th:nth-child(2){width:17%}.queue-table th:nth-child(3){width:17%}.queue-table th:nth-child(4){width:12%}.queue-table th:nth-child(5){width:9%}.queue-table th:nth-child(6){width:25%}.queue-table th:nth-child(7){width:11%}
+.queue-table button{height:32px;padding:0 10px;white-space:nowrap}
+.queue-reason{white-space:normal;overflow-wrap:anywhere}
+.queue-muted,.queue-empty{color:var(--muted);font-size:12px}
+#queueMessages{margin-top:24px}
+#queueMessages h3{font-size:15px;margin:0 0 8px}
+#queueMessages .queue-table th{width:auto}
+.queue-message-pager{display:flex;align-items:center;gap:10px;margin-top:12px}
+@media(max-width:750px){.queue-count{margin-left:0;width:100%}.queue-node{gap:6px 14px}}
