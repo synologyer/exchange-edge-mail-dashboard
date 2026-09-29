@@ -36,10 +36,11 @@ do {
     }
     try {
         if (-not (Get-Command Get-Queue -ErrorAction SilentlyContinue)) {
-            $exchangePath = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\ExchangeServer\v15\Setup').MsiInstallPath
-            . (Join-Path $exchangePath 'bin\exchange.ps1')
+            # Edge uses local Exchange snap-ins. Do not invoke the Mailbox
+            # server's exchange.ps1 bootstrap, which expects AD session cmdlets.
+            Add-PSSnapin Microsoft.Exchange.Management.PowerShell.SnapIn -ErrorAction Stop
             if (-not (Get-Command Get-Queue -ErrorAction SilentlyContinue)) {
-                throw 'Get-Queue unavailable. Confirm Exchange Edge Management Shell (exshell.psc1) is installed.'
+                throw 'Get-Queue unavailable after loading the local Exchange snap-in.'
             }
         }
         $remaining = $MaxMessages
